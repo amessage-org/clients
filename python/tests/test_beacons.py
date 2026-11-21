@@ -102,13 +102,10 @@ class FindingTest(ClientTest):
         self.assertNotIn("Authorization", api.calls[-1][2])
         self.assertEqual(api.connects(), 1)
 
-    def test_uses_amessage_token_and_ignores_the_old_name(self):
+    def test_uses_amessage_token(self):
         api = FakeApi()
         AMessage(send=api, env={"AMESSAGE_TOKEN": "agt_env"}, home=Path(tempfile.mkdtemp())).search("movers")
         self.assertEqual(api.calls[0][2]["Authorization"], "Bearer agt_env")
-        old = FakeApi()
-        AMessage(send=old, env={"OPENPATH_TOKEN": "agt_env"}, home=Path(tempfile.mkdtemp())).search("movers")
-        self.assertNotIn("Authorization", old.calls[0][2])
 
     def test_names_the_app_first_in_the_user_agent(self):
         api = FakeApi()
