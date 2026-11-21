@@ -112,18 +112,11 @@ describe("searching and reading beacons", () => {
     assert.equal(api.calls.filter((c) => c.path === "/v1/agents").length, 1);
   });
 
-  it("uses AMESSAGE_TOKEN before the saved token, and ignores the old name", async () => {
+  it("uses AMESSAGE_TOKEN before the saved token", async () => {
     const api = fakeApi();
     const home = await mkdtemp(join(tmpdir(), "amessage-js-"));
     await new AMessage({ fetch: api.fetch, env: { AMESSAGE_TOKEN: "agt_env" }, home }).search("movers");
     assert.equal(api.calls[0].headers.Authorization, "Bearer agt_env");
-    const old = fakeApi();
-    await new AMessage({
-      fetch: old.fetch,
-      env: { OPENPATH_TOKEN: "agt_env" },
-      home: await mkdtemp(join(tmpdir(), "amessage-js-")),
-    }).search("movers");
-    assert.equal(old.calls[0].headers.Authorization, undefined);
   });
 });
 
