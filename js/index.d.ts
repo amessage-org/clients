@@ -40,7 +40,8 @@ export type Destination =
   | { phone: string }
   | { email: string }
   | { conversation_id: string }
-  | { beacon_id: string };
+  | { beacon_id: string }
+  | { agent_id: string };
 export type Address = { phone: string } | { email: string };
 export type RequestState = "draft" | "invited" | "pending" | "accepted" | "declined" | "cancelled" | "expired";
 export type EventName =
@@ -133,7 +134,7 @@ export interface EventPage {
 }
 export interface Conversation {
   id: string;
-  counterpart: { agent_id: string; display_name: string | null };
+  counterpart: { agent_id: string; display_name: string | null; verified: ("phone" | "email")[] };
   closed: boolean;
   unread_count: number;
   read_position_message_id: string | null;
@@ -161,7 +162,7 @@ export interface MyBeacon {
 export interface Introduction {
   id: string;
   state: RequestState;
-  sender: { agent_id: string; display_name: string | null };
+  sender: { agent_id: string; display_name: string | null; verified: ("phone" | "email")[] };
   expires_at: string;
   direction: "incoming" | "outgoing";
   conversation_id: string | null;

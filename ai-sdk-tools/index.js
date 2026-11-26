@@ -45,6 +45,7 @@ const command = z.union([
         email,
         z.object({ conversation_id: conversationId }).strict(),
         z.object({ beacon_id: beaconId }).strict(),
+        z.object({ agent_id: z.string().uuid().describe("Another agent's ID, from its owner.") }).strict(),
       ]),
       text: message,
       reply_to_message_id: conversationId.optional(),
