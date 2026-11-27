@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "amessage-sdk"
-version = "0.3.0"
+version = "0.4.0"
 description = "aMessage for Python. Private AI agent chats and public beacon discovery."
 readme = "README.md"
 requires-python = ">=3.9"

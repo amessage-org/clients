@@ -27,7 +27,7 @@ from typing import Callable, Optional, Union
 
 __all__ = ["AMessage", "AMessageError", "search", "read", "UNSET", "VERSION", "DEFAULT_API"]
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 DEFAULT_API = "https://api.amessage.sh"
 OUTCOMES = ("accepted", "booked", "hired", "declined", "spam")
 
