@@ -8,10 +8,11 @@ import type {
   ChatCommand,
   ChatResults,
   PreferencesChange,
+  Destination,
 } from "@amessage/sdk";
 import type { Tool } from "ai";
 
-export interface AMessageToolOptions extends Pick<AMessageOptions, "app" | "token" | "saveToken" | "apiUrl"> {
+export interface AMessageToolOptions extends Pick<AMessageOptions, "app" | "token" | "saveToken" | "apiUrl" | "encryption"> {
   /** A client to use instead of a new one, such as one shared with your own code. */
   client?: AMessage;
 }
@@ -25,9 +26,13 @@ export interface SearchBeaconsInput {
   cursor?: string;
 }
 
-/** A chat command as the agentChat tool takes it: set_preferences may leave out the etag, and the tool reads it. */
+/**
+ * A chat command as the agentChat tool takes it: set_preferences may leave out the etag, and the tool reads it.
+ * send takes text: the client seals it when encryption is on.
+ */
 export type AgentChatCommand =
-  | Exclude<ChatCommand, { action: "set_preferences" }>
+  | Exclude<ChatCommand, { action: "set_preferences" } | { action: "send" }>
+  | { action: "send"; to: Destination; text: string; reply_to_message_id?: string; key?: string }
   | ({ action: "set_preferences"; etag?: string } & PreferencesChange);
 
 /** A type, not an interface, so it fits the AI SDK's ToolSet. */
@@ -42,7 +47,11 @@ export type WriteTools = {
   readConversations: Tool<{ cursor?: string; conversationId?: string }, unknown>;
   reply: Tool<{ conversationId: string; text: string; replyToMessageId?: string; key?: string }, unknown>;
   markOutcome: Tool<{ messageId: string; outcome: Outcome }, unknown>;
-  reportConversation: Tool<{ conversationId: string; reason: string; block?: boolean; key?: string }, unknown>;
+  /** `reveal`: message ids of an encrypted chat to open here and show aMessage. */
+  reportConversation: Tool<
+    { conversationId: string; reason: string; block?: boolean; reveal?: string[]; key?: string },
+    unknown
+  >;
   /** `location` is an exact point; left out or null, the beacon applies anywhere. */
   createBeacon: Tool<{ text: string; location?: Point | null; welcome_chat?: boolean; key?: string }, unknown>;
   /** `location` says where it is now. */

@@ -49,3 +49,17 @@ export async function settings(agent: AMessage) {
   const taking = await agent.setTakingMessages(true);
   return [me.agent_id, named.name, viaChat.new_contacts, changed.allow_from, taking.new_contacts];
 }
+
+export async function encryptedChat(agent: AMessage, agentId: string): Promise<unknown[]> {
+  const mine = await agent.createKeys();
+  const theirs = await agent.agentKeys(agentId);
+  const sent = await agent.sendMessage({ agent_id: agentId }, "Is Thursday free?", { encrypted: true });
+  const opened = sent.opened?.text ?? (await agent.open(sent))?.text ?? null;
+  const envelope = await agent.seal({ agent_id: agentId }, "Sealed by hand");
+  const again = await agent.chat({ action: "send", to: { agent_id: agentId }, encrypted: envelope });
+  const found = await agent.chat({ action: "key_lookup", to: { email: "alex@example.com" } });
+  await agent.reportConversation(again.conversation_id ?? "", "spam", { reveal: [again.id] });
+  const tools: ToolSet = amessageTools({ write: true, encryption: true });
+  const keyInput: ChatInput = { command: { action: "agent_keys", agent_id: agentId } };
+  return [mine.fingerprint, theirs?.key_changed, opened, found?.agent_id, tools, keyInput];
+}

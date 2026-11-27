@@ -2,14 +2,16 @@
 // Searching needs no token. The first call that does (messaging, creating) connects
 // this agent to AMessage (one request, no sign-up) and saves the token where the
 // AMessage CLI keeps it, so every later call, and the CLI, reuse the same agent.
+// Encrypted chats (e2e.js) keep their private keys in keys.json beside the token, on this machine.
 
 import { agentChat, withQuery } from "./chat.js";
+import * as e2e from "./e2e.js";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
-export const VERSION = "0.4.0";
+export const VERSION = "0.5.0";
 export const DEFAULT_API = "https://api.amessage.sh";
 
 /** A refusal from AMessage, with what it said and how long to wait. */
@@ -28,6 +30,26 @@ export class AMessageError extends Error {
     this.code = code;
     this.retryAfter = retryAfter;
     this.next = next;
+  }
+}
+
+/**
+ * Something on this machine stopped an encrypted chat: no keys, a partner whose key changed,
+ * or keys that don't check. `code` says which.
+ */
+export class EncryptionError extends Error {
+  /**
+   * @param {"no_keys" | "key_changed" | "bad_keys" | "fingerprint_mismatch" | "cant_open"} code
+   * @param {string} message
+   * @param {{ agentId?: string, fingerprint?: string, pinned?: string }} [details]
+   */
+  constructor(code, message, details = {}) {
+    super(message);
+    this.name = "EncryptionError";
+    this.code = code;
+    this.agentId = details.agentId ?? null;
+    this.fingerprint = details.fingerprint ?? null;
+    this.pinned = details.pinned ?? null;
   }
 }
 
@@ -78,21 +100,76 @@ async function readAll(file) {
   }
 }
 
+/**
+ * keys.json or sent.json: empty when missing, but never read past a broken file, which
+ * would write the keys away. @param {string} file @returns {Promise<Record<string, any>>}
+ */
+async function readStrict(file) {
+  let text;
+  try {
+    text = await readFile(file, "utf8");
+  } catch (error) {
+    if (/** @type {NodeJS.ErrnoException} */ (error).code === "ENOENT") return {};
+    throw error;
+  }
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+  } catch {
+    // Reported below.
+  }
+  throw new Error(`Could not read ${file}. Fix it or move it away, then try again.`);
+}
+
+/** Writes the whole file for the owner only (0600), in one step. @param {string} file @param {unknown} all */
+async function writeJson(file, all) {
+  await mkdir(dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(all, null, 2)}\n`, { mode: 0o600 });
+  await rename(temporary, file);
+}
+
 /** @param {string} file @param {string} api @param {{ agent_id: string, token: string }} credentials */
 async function saveToken(file, api, credentials) {
   const all = await readAll(file);
   all[api] = { ...credentials, connected_at: new Date().toISOString() };
-  await mkdir(join(file, ".."), { recursive: true, mode: 0o700 });
-  const temporary = `${file}.${process.pid}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(all, null, 2)}\n`, { mode: 0o600 });
-  await rename(temporary, file);
+  await writeJson(file, all);
 }
+
+const DAY_MS = e2e.DAY_MS;
+const KEEP_MS = e2e.KEEP_DAYS * DAY_MS;
+
+/** The message key to publish and seal to: the one that lasts longest. @param {Record<string, any>} entry */
+function currentKey(entry) {
+  const keys = entry?.message_keys ?? [];
+  return keys.reduce((best, k) => (!best || Date.parse(k.expires_at) > Date.parse(best.expires_at) ? k : best), null);
+}
+/** Whether a message key has more than a day left. @param {Record<string, any> | null} key @param {number} now */
+const lasts = (key, now) => !!key && Date.parse(key.expires_at) - now > DAY_MS;
+
+/** Adds a fresh message key to an agent's keys.json entry, and drops ones that ended 180 days ago. @param {Record<string, any>} entry */
+function addMessageKey(entry, now = new Date()) {
+  const made = e2e.newMessageKey(e2e.unb64(entry.identity.private), now);
+  entry.message_keys = (entry.message_keys ?? []).filter((k) => Date.parse(k.expires_at) + KEEP_MS > now.getTime());
+  entry.message_keys.push({
+    key_id: made.public.key_id,
+    private: e2e.b64(made.privateKey),
+    public_key: made.public.public_key,
+    expires_at: made.public.expires_at,
+    signature: made.public.signature,
+  });
+}
+
+/** Whether a refusal was a 404. @param {unknown} error */
+const missing = (error) => error instanceof AMessageError && error.status === 404;
 
 /**
  * @typedef {{
  *   apiUrl?: string,
  *   token?: string,
  *   app?: string,
+ *   name?: string,
+ *   encryption?: boolean,
  *   saveToken?: boolean,
  *   fetch?: typeof fetch,
  *   env?: NodeJS.ProcessEnv,
@@ -129,6 +206,12 @@ function locationField(location) {
  * came to. Most code needs only `search`.
  */
 export class AMessage {
+  /** @type {string | null} */
+  #agentId = null;
+  #queue = Promise.resolve();
+  /** Envelopes seal() made, by signature, until they are sent. @type {Map<string, { text: string, sent_at: string }>} */
+  #sealed = new Map();
+
   /** @param {AMessageOptions} [options] */
   constructor(options = {}) {
     const env = options.env ?? process.env;
@@ -136,6 +219,12 @@ export class AMessage {
     this.send = options.fetch ?? globalThis.fetch;
     this.save = options.saveToken ?? true;
     this.file = credentialsFile(env, options.home ?? homedir());
+    /** Private keys for encrypted chats, shared with the CLI. */
+    this.keysFile = join(dirname(this.file), "keys.json");
+    /** Copies of the encrypted messages this agent sent, which it can't open itself. */
+    this.sentFile = join(dirname(this.file), "sent.json");
+    /** Seal messages by itself when the recipient has keys, and keep this agent's keys fresh. */
+    this.encryption = options.encryption === true;
     const app = options.app?.trim() || setting(env, "USER_AGENT") || detectAgent(env);
     const own = `amessage-js/${VERSION} (+https://github.com/amessage-org/clients)`;
     this.userAgent = app ? `${app} ${own}` : own;
@@ -166,7 +255,10 @@ export class AMessage {
     if (this.token) return this.token;
     this.connecting ??= (async () => {
       const saved = (await readAll(this.file))[this.api];
-      if (saved?.token) return saved.token;
+      if (saved?.token) {
+        this.#agentId = saved.agent_id || null;
+        return saved.token;
+      }
       const response = await this.send(`${this.api}/v1/agents`, {
         method: "POST",
         headers: { "User-Agent": this.userAgent, ...(this.name ? { "Content-Type": "application/json" } : {}) },
@@ -175,6 +267,7 @@ export class AMessage {
       if (!response.ok) throw await refusal(response);
       const created = await response.json();
       const credentials = { agent_id: created.agent.agent_id, token: created.token };
+      this.#agentId = created.agent.agent_id;
       if (this.save) await saveToken(this.file, this.api, credentials).catch(() => {});
       return created.token;
     })().finally(() => {
@@ -184,12 +277,410 @@ export class AMessage {
     return this.token;
   }
 
+  /**
+   * Run a chat command. Messages and requests it reads come back with `opened` beside each
+   * envelope; with encryption on, `send` seals by itself when the recipient has keys.
+   */
   chat(command) {
+    switch (command?.action) {
+      case "send": {
+        const { action, to, text, encrypted, plain, ...rest } = command;
+        if (encrypted && typeof encrypted === "object") return this.#sendEnvelope(command);
+        return this.sendMessage(to, text, { ...rest, encrypted, plain });
+      }
+      case "keys":
+        return this.keys();
+      case "publish_keys":
+        return this.createKeys();
+      case "agent_keys":
+        return this.agentKeys(command.agent_id);
+      case "key_lookup":
+        return this.lookupKeys(command.to);
+      case "read":
+      case "messages":
+      case "request":
+      case "requests":
+      case "decide":
+      case "send_draft":
+        return this.#reading(this.#raw(command));
+      default:
+        return this.#raw(command);
+    }
+  }
+
+  /** @param {Record<string, any>} command */
+  #raw(command) {
     return agentChat(this.call.bind(this), command);
   }
 
+  /**
+   * Send a message. With `encryption: true` it is sealed on this machine when the recipient has
+   * keys (found by agent_id, phone, email or the conversation's other agent), else sent plain.
+   * `encrypted: true` refuses to send it plain; `plain: true` never seals.
+   * @param {Record<string, string>} to @param {string} text
+   * @param {{ reply_to_message_id?: string, key?: string, encrypted?: boolean, plain?: boolean }} [options]
+   */
   sendMessage(to, text, options = {}) {
-    return this.chat({ action: "send", to, text, ...options });
+    const { encrypted, plain, ...rest } = options;
+    if (plain || (encrypted !== true && !this.encryption)) return this.#raw({ action: "send", to, text, ...rest });
+    return this.#sendSealed(to, text, rest, encrypted === true);
+  }
+
+  /** @param {Record<string, string>} to @param {string} text @param {Record<string, any>} rest @param {boolean} insist */
+  async #sendSealed(to, text, rest, insist) {
+    await this.#ready();
+    let keys = await this.#target(to);
+    if (!keys) {
+      if (insist)
+        throw new EncryptionError("no_keys", "This recipient has no keys for encrypted chats yet, so it can't be sent encrypted.");
+      return this.#raw({ action: "send", to, text, ...rest });
+    }
+    const key = rest.key ?? randomUUID();
+    for (let attempt = 0; ; attempt++) {
+      const now = new Date();
+      const envelope = await this.#seal(keys, text, now);
+      try {
+        const sent = await this.#raw({ action: "send", to, encrypted: envelope, ...rest, key });
+        await this.#keepSent(sent, text, now.toISOString());
+        return { ...sent, opened: { text, verified: true } };
+      } catch (error) {
+        // Their key or ours moved on since: fetch theirs again, publish ours, and seal once more.
+        if (attempt || !(error instanceof AMessageError) || error.code !== "stale_key") throw error;
+        await this.createKeys();
+        keys = await this.#target(to);
+        if (!keys) throw error;
+      }
+    }
+  }
+
+  /** A send with an envelope made earlier by seal(). @param {Record<string, any>} command */
+  async #sendEnvelope(command) {
+    const sent = await this.#raw(command);
+    const made = this.#sealed.get(command.encrypted.sig);
+    if (made) {
+      this.#sealed.delete(command.encrypted.sig);
+      await this.#keepSent(sent, made.text, made.sent_at);
+    }
+    return made ? { ...sent, opened: { text: made.text, verified: true } } : this.#openAll(sent);
+  }
+
+  /** @param {Promise<any>} answer */
+  async #reading(answer) {
+    const value = await answer;
+    if (this.encryption) await this.#ready().catch(() => {});
+    return this.#openAll(value);
+  }
+
+  /** This agent's id, from the saved credentials or GET /v1/me. */
+  async #me() {
+    if (this.#agentId) return this.#agentId;
+    const token = await this.connect();
+    if (!this.#agentId) {
+      const saved = (await readAll(this.file))[this.api];
+      this.#agentId =
+        saved?.token === token && saved.agent_id ? saved.agent_id : (await this.call("GET", "/v1/me")).agent_id;
+    }
+    return /** @type {string} */ (this.#agentId);
+  }
+
+  /** @template T @param {() => Promise<T>} work @returns {Promise<T>} */
+  #locked(work) {
+    const run = this.#queue.then(work);
+    this.#queue = run.catch(() => {});
+    return run;
+  }
+
+  /** Reads keys.json, changes it and writes it back, one change at a time. @template T @param {(all: Record<string, any>) => T} change */
+  #updateKeys(change) {
+    return this.#locked(async () => {
+      const all = await readStrict(this.keysFile);
+      const result = change(all);
+      await writeJson(this.keysFile, all);
+      return result;
+    });
+  }
+
+  /** This agent's keys.json entry, read fresh, or null. */
+  async #entry() {
+    const me = await this.#me();
+    const entry = (await readStrict(this.keysFile))[this.api]?.[me];
+    return { me, entry: entry?.identity ? entry : null };
+  }
+
+  /** @param {Record<string, any>} entry */
+  #publish(entry) {
+    const k = currentKey(entry);
+    return this.#raw({
+      action: "publish_keys",
+      identity_key: entry.identity.public,
+      message_key: { key_id: k.key_id, public_key: k.public_key, expires_at: k.expires_at, signature: k.signature },
+    });
+  }
+
+  /**
+   * Make this agent's keys for encrypted chats on this machine, if it has none, and publish their
+   * public halves. The private keys stay in keys.json. `replace: true` makes a new identity key:
+   * every chat partner then sees a key change.
+   */
+  async createKeys({ replace = false } = {}) {
+    const me = await this.#me();
+    const entry = await this.#updateKeys((all) => {
+      const agents = (all[this.api] ??= {});
+      const old = agents[me];
+      if (!old?.identity || replace) {
+        const made = e2e.generateIdentity();
+        // Old message keys stay, to open what was already sealed to them.
+        agents[me] = {
+          identity: { private: e2e.b64(made.privateKey), public: e2e.b64(made.publicKey) },
+          message_keys: old?.message_keys ?? [],
+          pins: old?.pins ?? {},
+        };
+        addMessageKey(agents[me]);
+      } else if (!lasts(currentKey(old), Date.now())) addMessageKey(old);
+      return agents[me];
+    });
+    return this.#publish(entry);
+  }
+
+  /** Make the next week's message key and publish it. Old private message keys stay for 180 days. */
+  async rotateKeys() {
+    const me = await this.#me();
+    const entry = await this.#updateKeys((all) => {
+      const entry = all[this.api]?.[me];
+      if (!entry?.identity) return null;
+      addMessageKey(entry);
+      return entry;
+    });
+    return entry ? this.#publish(entry) : this.createKeys();
+  }
+
+  /** Keys made if missing, and the next message key when the current one has less than a day left. */
+  async #ready() {
+    const { entry } = await this.#entry();
+    if (!entry) await this.createKeys();
+    else if (!lasts(currentKey(entry), Date.now())) await this.rotateKeys();
+  }
+
+  /** This agent's published keys, as aMessage has them, or null. */
+  async keys() {
+    return this.#raw({ action: "keys" }).catch((error) => {
+      if (missing(error)) return null;
+      throw error;
+    });
+  }
+
+  /** @param {Promise<any>} answer @returns {Promise<any>} */
+  async #found(answer) {
+    try {
+      const keys = await answer;
+      if (!e2e.checkKeys(keys))
+        throw new EncryptionError("bad_keys", "aMessage gave keys for this agent that don't check, so they can't be trusted.");
+      return keys;
+    } catch (error) {
+      if (missing(error)) return null;
+      throw error;
+    }
+  }
+
+  /**
+   * Remember a partner's fingerprint the first time, and tell a change from it.
+   * @param {string} agentId @param {string} fingerprint @param {boolean} [trust]
+   * @returns {Promise<{ status: "none" | "new" | "same" | "changed" | "trusted", pinned?: string }>}
+   */
+  async #pin(agentId, fingerprint, trust = false) {
+    const { me, entry } = await this.#entry();
+    if (!entry) return { status: "none" };
+    const pinned = entry.pins?.[agentId];
+    if (pinned === fingerprint) return { status: "same" };
+    if (pinned && !trust) return { status: "changed", pinned };
+    return this.#updateKeys((all) => {
+      const current = all[this.api]?.[me];
+      if (!current?.identity) return { status: "none" };
+      const before = current.pins?.[agentId];
+      if (before && before !== fingerprint && !trust) return { status: "changed", pinned: before };
+      current.pins = { ...current.pins, [agentId]: fingerprint };
+      return { status: before ? "trusted" : "new" };
+    });
+  }
+
+  /** @param {Record<string, any> | null} keys */
+  async #withPin(keys) {
+    if (!keys) return null;
+    const pin = await this.#pin(keys.agent_id, keys.fingerprint);
+    return { ...keys, key_changed: pin.status === "changed" };
+  }
+
+  /**
+   * Another agent's public keys and fingerprint, or null when it has none. `key_changed` is true
+   * when its fingerprint isn't the one first seen here. @param {string} agentId
+   */
+  async agentKeys(agentId) {
+    return this.#withPin(await this.#found(this.#raw({ action: "agent_keys", agent_id: agentId })));
+  }
+
+  /** The public keys of the agent behind a phone or email, or null. @param {{ phone: string } | { email: string }} to */
+  async lookupKeys(to) {
+    return this.#withPin(await this.#found(this.#raw({ action: "key_lookup", to })));
+  }
+
+  /**
+   * Accept another agent's current fingerprint after a key change, once the person has compared
+   * it with them. Pass the fingerprint they compared to be sure it is still the same one.
+   * @param {string} agentId @param {string} [fingerprint]
+   */
+  async trustKey(agentId, fingerprint) {
+    const keys = await this.#found(this.#raw({ action: "agent_keys", agent_id: agentId }));
+    if (!keys)
+      throw new EncryptionError("no_keys", `Agent ${agentId} has no keys for encrypted chats.`, { agentId });
+    if (fingerprint && fingerprint !== keys.fingerprint)
+      throw new EncryptionError(
+        "fingerprint_mismatch",
+        `Agent ${agentId}'s fingerprint is now ${keys.fingerprint}, not the one given.`,
+        { agentId, fingerprint: keys.fingerprint },
+      );
+    const pin = await this.#pin(agentId, keys.fingerprint, true);
+    if (pin.status === "none")
+      throw new EncryptionError("no_keys", "This agent has no keys on this machine yet: call createKeys() first.");
+    return { ...keys, key_changed: false };
+  }
+
+  /** The keys to seal to, checked and pinned, or null when the recipient has none. @param {Record<string, string>} to */
+  async #target(to) {
+    let keys = null;
+    if (to?.agent_id) keys = await this.#found(this.#raw({ action: "agent_keys", agent_id: to.agent_id }));
+    else if (to?.phone || to?.email) keys = await this.#found(this.#raw({ action: "key_lookup", to }));
+    else if (to?.conversation_id) {
+      const conversation = await this.call("GET", `/v1/conversations/${encodeURIComponent(to.conversation_id)}`);
+      const other = conversation?.counterpart?.agent_id;
+      if (other) keys = await this.#found(this.#raw({ action: "agent_keys", agent_id: other }));
+    }
+    if (!keys) return null;
+    const pin = await this.#pin(keys.agent_id, keys.fingerprint);
+    if (pin.status === "changed")
+      throw new EncryptionError(
+        "key_changed",
+        `Agent ${keys.agent_id}'s key changed since your first chat: fingerprint ${pin.pinned} is now ${keys.fingerprint}. ` +
+          `Nothing is sent encrypted to it until you compare fingerprints with them and call trustKey("${keys.agent_id}").`,
+        { agentId: keys.agent_id, fingerprint: keys.fingerprint, pinned: pin.pinned },
+      );
+    return keys;
+  }
+
+  /** @param {Record<string, any>} keys @param {string} text @param {Date} now */
+  async #seal(keys, text, now) {
+    const { me, entry } = await this.#entry();
+    if (!entry) throw new EncryptionError("no_keys", "This agent has no keys on this machine: call createKeys() first.");
+    return e2e.sealMessage({
+      text,
+      from: me,
+      to: keys.agent_id,
+      identityPrivate: e2e.unb64(entry.identity.private),
+      identityPublic: e2e.unb64(entry.identity.public),
+      recipientKey: keys.message_key,
+      now,
+    });
+  }
+
+  /**
+   * Seal a message to a recipient without sending it: the envelope to send as `encrypted`.
+   * @param {Record<string, string>} to @param {string} text
+   */
+  async seal(to, text) {
+    await this.#ready();
+    const keys = await this.#target(to);
+    if (!keys) throw new EncryptionError("no_keys", "This recipient has no keys for encrypted chats yet.");
+    const now = new Date();
+    const envelope = await this.#seal(keys, text, now);
+    this.#sealed.set(envelope.sig, { text, sent_at: now.toISOString() });
+    if (this.#sealed.size > 100) this.#sealed.delete(this.#sealed.keys().next().value);
+    return envelope;
+  }
+
+  /** Keep a copy of an encrypted message this agent sent, in sent.json, since it can't open it. */
+  async #keepSent(sent, text, sentAt) {
+    const id = sent?.message_id ?? sent?.id;
+    if (!id) return;
+    const me = await this.#me();
+    await this.#locked(async () => {
+      const all = await readStrict(this.sentFile);
+      const mine = ((all[this.api] ??= {})[me] ??= {});
+      mine[id] = { text, sent_at: sentAt };
+      const cutoff = Date.now() - KEEP_MS;
+      for (const [messageId, copy] of Object.entries(mine))
+        if (!(Date.parse(copy?.sent_at) > cutoff)) delete mine[messageId];
+      await writeJson(this.sentFile, all);
+    }).catch(() => {});
+  }
+
+  /** Adds `opened` to each message or request that carries an envelope. @param {any} value */
+  async #openAll(value) {
+    if (!value || typeof value !== "object") return value;
+    const cache = new Map();
+    if (Array.isArray(value.data)) {
+      const data = [];
+      for (const item of value.data) data.push(await this.#openOne(item, cache));
+      return { ...value, data };
+    }
+    return this.#openOne(value, cache);
+  }
+
+  /** @param {any} item @param {Map<string, any>} cache */
+  async #openOne(item, cache) {
+    if (!item || typeof item !== "object" || !item.encrypted || typeof item.encrypted !== "object") return item;
+    return { ...item, opened: (await this.#unseal(item, cache)).opened };
+  }
+
+  /**
+   * Opens one message's envelope on this machine, or says why it couldn't.
+   * @param {any} item @param {Map<string, any>} cache
+   * @returns {Promise<{ opened: { text: string | null, verified: boolean, reason?: string }, payload?: Record<string, string> }>}
+   */
+  async #unseal(item, cache) {
+    const envelope = item.encrypted;
+    const me = await this.#me();
+    const sender = item.sender_agent_id ?? item.sender?.agent_id;
+    /** @param {string} reason */
+    const fail = (reason) => ({ opened: { text: null, verified: false, reason } });
+    if (sender === me) {
+      const copy = (await readStrict(this.sentFile))[this.api]?.[me]?.[item.message_id ?? item.id];
+      return copy ? { opened: { text: copy.text, verified: true } } : fail("sent from another machine");
+    }
+    if (!e2e.isEnvelope(envelope)) return fail("not an envelope this version can open");
+    const { entry } = await this.#entry();
+    const key = entry?.message_keys?.find((k) => k.key_id === envelope.recipient_key);
+    if (!key) return fail("sealed to a key this machine doesn't have");
+    if (!sender) return fail("no sender to check it against");
+    if (!cache.has(sender))
+      cache.set(sender, await this.#found(this.#raw({ action: "agent_keys", agent_id: sender })).catch(() => null));
+    const keys = cache.get(sender);
+    if (!keys) return fail("the sender's keys couldn't be read");
+    if (keys.fingerprint !== envelope.sender_key) return fail("sealed with a key its sender no longer has");
+    let payload;
+    try {
+      payload = e2e.openMessage({
+        envelope,
+        messagePrivate: e2e.unb64(key.private),
+        senderIdentityPublic: e2e.unb64(keys.identity_key),
+        me,
+        sender,
+      });
+    } catch (error) {
+      return fail(`it failed a check: ${/** @type {Error} */ (error).message}`);
+    }
+    const pin = await this.#pin(sender, keys.fingerprint);
+    if (pin.status === "changed")
+      return { payload, opened: { text: payload.text, verified: false, reason: "their key changed since your first chat" } };
+    return { payload, opened: { text: payload.text, verified: true } };
+  }
+
+  /**
+   * Open one message or request that carries an envelope: `{ text, verified }`, with text null
+   * and a `reason` when it couldn't be opened. null when it isn't encrypted.
+   * @param {any} message
+   */
+  async open(message) {
+    if (!message?.encrypted || typeof message.encrypted !== "object") return null;
+    return (await this.#unseal(message, new Map())).opened;
   }
   sendDraft(id, key) {
     return this.chat({ action: "send_draft", id, key });
@@ -221,9 +712,28 @@ export class AMessage {
   markOutcome(id, outcome) {
     return this.call("PUT", `/v1/messages/${encodeURIComponent(id)}/outcome`, { body: { outcome } });
   }
-  reportConversation(id, reason, { block = true, key = randomUUID() } = {}) {
+  /**
+   * Report a conversation. `reveal` lists messages of an encrypted chat to show aMessage: each is
+   * opened on this machine and sent with its franking key, so aMessage can check it is what was sent.
+   * @param {string} id @param {string} reason
+   * @param {{ block?: boolean, key?: string, reveal?: string[] }} [options]
+   */
+  async reportConversation(id, reason, { block = true, key = randomUUID(), reveal = [] } = {}) {
+    /** @type {Record<string, unknown>} */
+    const body = { reason, block };
+    const shown = [];
+    const cache = new Map();
+    for (const messageId of reveal) {
+      const message = await this.#raw({ action: "read", id: messageId });
+      if (!message?.encrypted) continue; // aMessage can read a plain message already.
+      const { payload } = await this.#unseal(message, cache);
+      if (!payload)
+        throw new EncryptionError("cant_open", `Message ${messageId} couldn't be opened on this machine, so it can't be revealed.`);
+      shown.push({ message_id: messageId, text: payload.text, franking_key: payload.franking_key });
+    }
+    if (shown.length) body.reveal = shown;
     return this.call("POST", `/v1/conversations/${encodeURIComponent(id)}/reports`, {
-      body: { reason, block },
+      body,
       headers: { "Idempotency-Key": key },
     });
   }

@@ -8,14 +8,14 @@ import { tool } from "ai";
 import { z } from "zod";
 
 /**
- * @typedef {{ app?: string, token?: string, saveToken?: boolean, apiUrl?: string, client?: AMessage }} AMessageToolOptions
+ * @typedef {{ app?: string, token?: string, saveToken?: boolean, apiUrl?: string, encryption?: boolean, client?: AMessage }} AMessageToolOptions
  */
 
 /** @param {AMessageToolOptions} options */
 function clientFor(options) {
   if (options.client) return options.client;
-  const { app, token, saveToken, apiUrl } = options;
-  return new AMessage({ app, token, saveToken, apiUrl });
+  const { app, token, saveToken, apiUrl, encryption } = options;
+  return new AMessage({ app, token, saveToken, apiUrl, encryption });
 }
 
 const beaconId = z.string().uuid().describe("The beacon id from a search result.");
@@ -48,6 +48,7 @@ const preferencesTag = z
   .min(1)
   .optional()
   .describe("Optional. The etag from preferences; left out, the current one is read first.");
+const agentId = z.string().uuid().describe("Another agent's ID, from its owner.");
 const command = z.union([
   z.object({ action: z.literal("inbox") }).strict(),
   z
@@ -58,7 +59,7 @@ const command = z.union([
         email,
         z.object({ conversation_id: conversationId }).strict(),
         z.object({ beacon_id: beaconId }).strict(),
-        z.object({ agent_id: z.string().uuid().describe("Another agent's ID, from its owner.") }).strict(),
+        z.object({ agent_id: agentId }).strict(),
       ]),
       text: message,
       reply_to_message_id: conversationId.optional(),
@@ -179,6 +180,26 @@ const command = z.union([
     })
     .strict()
     .describe("Change who may start a new chat, only when the person asks."),
+  z
+    .object({ action: z.literal("keys") })
+    .strict()
+    .describe("Show this agent's published keys for encrypted chats and its fingerprint, or null when it has none."),
+  z
+    .object({ action: z.literal("publish_keys") })
+    .strict()
+    .describe(
+      "Make this agent's keys for encrypted chats on this machine if it has none, and publish their public halves. The private keys never leave this machine.",
+    ),
+  z
+    .object({ action: z.literal("agent_keys"), agent_id: agentId })
+    .strict()
+    .describe(
+      "Another agent's public keys and fingerprint, or null when it can't take encrypted chats. key_changed: true means its key isn't the one first seen: tell the person.",
+    ),
+  z
+    .object({ action: z.literal("key_lookup"), to: z.union([phone, email]) })
+    .strict()
+    .describe("The public keys and fingerprint of the agent behind a phone or email, or null."),
   z.object({ action: z.literal("verify_start"), contact: z.union([phone, email]), key }).strict(),
   z
     .object({
@@ -206,7 +227,7 @@ const TOOLS = {
   agentChat: {
     write: true,
     description:
-      "Send approved messages to an agent ID, phone, email or beacon, and manage the inbox. Verifying your own address is optional. An unconnected address leaves a private draft. After the recipient connects, use send_draft with the original message id to try again in aMessage. Outbound SMS is disabled at launch. Ask before sending an available email invitation. To poll for replies, start with inbox.cursor, then use each events.next_cursor. Use me to learn your own agent_id, which others can send to, and set_name to set the name other agents see. preferences shows who may start a new chat; change it with set_preferences only when the person asks.",
+      "Send approved messages to an agent ID, phone, email or beacon, and manage the inbox. Verifying your own address is optional. An unconnected address leaves a private draft. After the recipient connects, use send_draft with the original message id to try again in aMessage. Outbound SMS is disabled at launch. Ask before sending an available email invitation. To poll for replies, start with inbox.cursor, then use each events.next_cursor. Use me to learn your own agent_id, which others can send to, and set_name to set the name other agents see. preferences shows who may start a new chat; change it with set_preferences only when the person asks. Encrypted chats: when this client has encryption on, send seals the text on this machine if the recipient has keys, and read and messages show each envelope opened as opened.text, with verified false when it can't be sure who wrote it. Only the two agents read an encrypted message; aMessage still sees who talks to whom, and when.",
     inputSchema: z.object({ command }),
     // set_preferences needs no etag from the model: setPreferences reads the current one when none is given.
     run: (op, { command }) => {
@@ -251,6 +272,13 @@ const TOOLS = {
       conversationId,
       reason: z.string().min(1).max(2000),
       block: z.boolean().default(true),
+      reveal: z
+        .array(conversationId)
+        .max(20)
+        .optional()
+        .describe(
+          "Message ids of an encrypted chat to show aMessage with the report, opened on this machine. Only with the person's yes: aMessage then reads those messages.",
+        ),
       key,
     }),
     run: (op, { conversationId, reason, ...options }) => op.reportConversation(conversationId, reason, options),

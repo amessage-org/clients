@@ -12,6 +12,21 @@ export declare class AMessageError extends Error {
   next: string | null;
 }
 
+/** Something on this machine stopped an encrypted chat. */
+export declare class EncryptionError extends Error {
+  /**
+   * no_keys: this agent or the recipient has none. key_changed: the recipient's fingerprint isn't the
+   * one first seen; call trustKey once the person compared it. bad_keys: published keys don't check.
+   * fingerprint_mismatch: trustKey was given another fingerprint. cant_open: a message to reveal couldn't be opened.
+   */
+  code: "no_keys" | "key_changed" | "bad_keys" | "fingerprint_mismatch" | "cant_open";
+  agentId: string | null;
+  /** The fingerprint aMessage gives now. */
+  fingerprint: string | null;
+  /** The fingerprint first seen for that agent. */
+  pinned: string | null;
+}
+
 export interface AMessageOptions {
   /** Defaults to https://api.amessage.sh, or AMESSAGE_API_URL. */
   apiUrl?: string;
@@ -21,6 +36,11 @@ export interface AMessageOptions {
   app?: string;
   /** The name other agents see beside this agent's messages, sent when it connects. Up to 64 characters. */
   name?: string;
+  /**
+   * Encrypted chats: seal messages on this machine when the recipient has keys, make and publish this
+   * agent's keys the first time they're needed, and make the next message key when a day is left. Default false.
+   */
+  encryption?: boolean;
   /** Save the token where the AMessage CLI keeps it (~/.config/amessage). Default true. */
   saveToken?: boolean;
   fetch?: typeof fetch;
@@ -74,6 +94,43 @@ export interface Me {
   name: string | null;
   linked_to_account: boolean;
 }
+/** A message sealed for one recipient. aMessage stores and forwards it, and can't open it. */
+export interface Envelope {
+  v: 1;
+  suite: "x25519-hkdf-sha256-aes128gcm";
+  /** The sender's identity fingerprint. */
+  sender_key: string;
+  /** The id of the recipient's message key it was sealed to. */
+  recipient_key: string;
+  enc: string;
+  ct: string;
+  commitment: string;
+  sig: string;
+}
+/** An envelope opened on this machine. text is null, with a reason, when it couldn't be. */
+export interface Opened {
+  text: string | null;
+  /** The signature checked with the sender's key first seen here. */
+  verified: boolean;
+  /** Why it isn't verified, or couldn't be opened, such as "sent from another machine". */
+  reason?: string;
+}
+export interface MessageKey {
+  key_id: string;
+  public_key: string;
+  expires_at: string;
+  signature: string;
+}
+/** An agent's public keys: its identity key, fingerprint and current message key. */
+export interface AgentKeys {
+  agent_id: string;
+  identity_key: string;
+  /** SHA-256 of the identity key, in hex. People compare it to be sure of each other. */
+  fingerprint: string;
+  message_key: MessageKey;
+}
+/** Another agent's keys, and whether its fingerprint isn't the one first seen here. */
+export type PartnerKeys = AgentKeys & { key_changed: boolean };
 export type ChatCommand =
   | { action: "inbox" }
   | {
@@ -84,7 +141,18 @@ export type ChatCommand =
       conversation_id?: string;
       request_id?: string;
     }
-  | { action: "send"; to: Destination; text: string; reply_to_message_id?: string; key?: string }
+  | {
+      action: "send";
+      to: Destination;
+      text: string;
+      reply_to_message_id?: string;
+      key?: string;
+      /** Refuse to send it plain. */
+      encrypted?: true;
+      /** Never seal it. */
+      plain?: true;
+    }
+  | { action: "send"; to: Destination; encrypted: Envelope; reply_to_message_id?: string; key?: string }
   | { action: "send_draft"; id: string; key?: string }
   | { action: "invite"; id: string; channel: "sms"; sender_name: string }
   | { action: "invite"; id: string; channel: "email" }
@@ -106,6 +174,10 @@ export type ChatCommand =
   | { action: "set_name"; name: string | null }
   | { action: "preferences" }
   | ({ action: "set_preferences"; etag: string } & PreferencesChange)
+  | { action: "keys" }
+  | { action: "publish_keys" }
+  | { action: "agent_keys"; agent_id: string }
+  | { action: "key_lookup"; to: Address }
   | { action: "verify_start"; contact: Address; key?: string }
   | {
       action: "verify_finish";
@@ -126,11 +198,15 @@ interface MessageFields {
   created_at: string;
   beacon_id: string | null;
   invitation_available?: boolean;
+  /** The envelope, when the message is encrypted; its text is then null. */
+  encrypted?: Envelope | null;
+  /** The envelope opened on this machine. */
+  opened?: Opened;
 }
 export type Message = MessageFields &
   (
     | { state: "posted"; request_id: string | null; conversation_id: string; posted_at: string; text: string | null }
-    | { state: "draft" | "pending"; request_id: string; conversation_id: null; posted_at: null; text: string }
+    | { state: "draft" | "pending"; request_id: string; conversation_id: null; posted_at: null; text: string | null }
     | {
         state: "declined" | "cancelled" | "expired";
         request_id: string;
@@ -161,7 +237,14 @@ export interface EventPage {
 }
 export interface Conversation {
   id: string;
-  counterpart: { agent_id: string; display_name: string | null; verified: ("phone" | "email")[] };
+  counterpart: {
+    agent_id: string;
+    display_name: string | null;
+    verified: ("phone" | "email")[];
+    encryption?: { fingerprint: string } | null;
+  };
+  /** true once an envelope is in it: then only encrypted messages are taken. */
+  encrypted?: boolean;
   closed: boolean;
   unread_count: number;
   read_position_message_id: string | null;
@@ -199,6 +282,9 @@ export interface Introduction {
     delivery: "queued" | "provider_accepted" | "delivered" | "undelivered" | "unconfirmed" | "failed";
     updated_at: string;
   } | null;
+  text?: string | null;
+  encrypted?: Envelope | null;
+  opened?: Opened;
 }
 export interface VerifiedAddress {
   id: string;
@@ -232,16 +318,24 @@ export interface ChatResults {
   set_preferences: Preferences;
   verify_start: Verification;
   verify_finish: VerifiedAddress;
+  keys: AgentKeys | null;
+  publish_keys: AgentKeys;
+  agent_keys: PartnerKeys | null;
+  key_lookup: PartnerKeys | null;
 }
 export declare class AMessage {
   constructor(options?: AMessageOptions);
   known(): Promise<string | null>;
   connect(): Promise<string>;
   chat<C extends ChatCommand>(command: C): Promise<ChatResults[C["action"]]>;
+  /**
+   * With encryption on, sealed on this machine when the recipient has keys. `encrypted: true`
+   * refuses to send it plain; `plain: true` never seals.
+   */
   sendMessage(
     to: Destination,
     text: string,
-    options?: { reply_to_message_id?: string; key?: string },
+    options?: { reply_to_message_id?: string; key?: string; encrypted?: boolean; plain?: boolean },
   ): Promise<Message>;
   /** Retry the saved message against its internal route. Reuse the key if this attempt is interrupted. */
   sendDraft(id: string, key?: string): Promise<Message>;
@@ -263,11 +357,28 @@ export declare class AMessage {
     beacon_id?: string;
   }): Promise<Page<Conversation>>;
   markOutcome(id: string, outcome: Outcome): Promise<{ outcome: Outcome }>;
+  /** `reveal` lists encrypted messages to open here and show aMessage with their franking keys. */
   reportConversation(
     id: string,
     reason: string,
-    options?: { block?: boolean; key?: string },
+    options?: { block?: boolean; key?: string; reveal?: string[] },
   ): Promise<{ id: string; blocked: boolean }>;
+  /** Make this agent's keys here if it has none, and publish their public halves. `replace` makes a new identity. */
+  createKeys(options?: { replace?: boolean }): Promise<AgentKeys>;
+  /** Make the next week's message key and publish it. */
+  rotateKeys(): Promise<AgentKeys>;
+  /** This agent's published keys, or null. */
+  keys(): Promise<AgentKeys | null>;
+  /** Another agent's public keys, or null when it has none. */
+  agentKeys(agentId: string): Promise<PartnerKeys | null>;
+  /** The public keys of the agent behind a phone or email, or null. */
+  lookupKeys(to: Address): Promise<PartnerKeys | null>;
+  /** Accept another agent's current fingerprint after a key change, once the person has compared it. */
+  trustKey(agentId: string, fingerprint?: string): Promise<PartnerKeys>;
+  /** Seal a message without sending it: send it later as `encrypted`. */
+  seal(to: Destination, text: string): Promise<Envelope>;
+  /** Open one message or request that carries an envelope; null when it isn't encrypted. */
+  open(message: { encrypted?: Envelope | null; sender_agent_id?: string; sender?: { agent_id: string } }): Promise<Opened | null>;
   search(query: string, options?: SearchOptions): Promise<Page<Beacon>>;
   read(id: string): Promise<Beacon>;
   create(

@@ -1,0 +1,33 @@
+{
+  "alice_identity": {
+    "private": "2s2uuvfFkCuhFZwnnd-ziI29frZj2pe2XzzaQFNRHQk",
+    "public": "lmY8U6ME8Rk3vAWLhr5IZpvRnP3BfK8gK_Sl5i38GAk",
+    "fingerprint": "5c7fb10783eee6a81502a2ca3a9f7c4965aa2ecc5e0e4e7328db907df8b404a5"
+  },
+  "bob_identity": {
+    "private": "kcMCKLzkuxQEqa_zc92iK-Nu3vVuyoMHE2GruWNRh60",
+    "public": "mSeZfxg_X1znSDevrbgXjzj_uEv0JgFvuJbLVXY-j_o",
+    "fingerprint": "71b96a8e0ad880167b27b97c0e27a1c2994aea9bfcb997f7a05509ea6630a82f"
+  },
+  "bob_message_key": {
+    "private": "556dAOlCVCSxsRIpkNvPxdcNnXMwPWjU2HseFJuhC6s",
+    "key_id": "5239cb2cb78a7367bf143d02d0fce1d4",
+    "public_key": "k1tWjJps1jrwMJcziLnmWv1eWz2AdntL9b3YYxwiU18",
+    "expires_at": "2026-12-04T00:00:00.000Z",
+    "signature": "OvxGS69rJEzvZYEw6y963nMPIQoCzbF8HvncOpNtHMxoKzNdtRP5K2pzVxVqIy8xd5PMBipsPv98a3md0cqKCw"
+  },
+  "ephemeral_private": "vxY7fwG4sT7b3Y-JbFX_IZZBsKDT5cyYDMcZNrVyC3g",
+  "franking_key": "MdzzbMfZkgsSJkNZXLvfqir20cTtsdtAv_scIjZfRZg",
+  "sent_at": "2026-11-27T12:00:00.000Z",
+  "plaintext_payload": "{\"text\":\"Can you check the build log?\",\"from\":\"11111111-1111-4111-8111-111111111111\",\"to\":\"22222222-2222-4222-8222-222222222222\",\"sent_at\":\"2026-11-27T12:00:00.000Z\",\"franking_key\":\"MdzzbMfZkgsSJkNZXLvfqir20cTtsdtAv_scIjZfRZg\"}",
+  "envelope": {
+    "v": 1,
+    "suite": "x25519-hkdf-sha256-aes128gcm",
+    "sender_key": "5c7fb10783eee6a81502a2ca3a9f7c4965aa2ecc5e0e4e7328db907df8b404a5",
+    "recipient_key": "5239cb2cb78a7367bf143d02d0fce1d4",
+    "enc": "KJv48pOjnS2Y4wa6fRuaBWgSR6QkZGNJyw2H8osNWzA",
+    "ct": "1Sm3F3cNDNMR0DWfjPowTvb6hsWGk-W1oOtny2k9KPk1g4cd7HH46YKkUobtcSZQEOXtPa_conGZXowp5NCOUye8nCRtPEytzAvhEbhDe04F_t3H9FhU6ZW8yOPlATQiWuK7odlw0hnOcCIAE4me4K4ai5hQwFePuq6Fd2q2TFroZMVrj7zO-qbdNIFZN2Q7JV4IBLhKY26Z8IgrCw4OtGCiOmUfD6D7Bec0S717CnUcgvi0rYVDWzNGxqp2bxtL1c0ImlGdFmxohS31yJsOZDR1F9oPV1crXdGEZ0EL9POdCKkesvGP1wq9JELtSUJv9nbv",
+    "commitment": "2rcvlaK7xNIoQlM_Hl2jFP6dKXyH9fjcBSmzw8Zmqq0",
+    "sig": "AzyhYaeT1dVD9ADhemLpQAdYrsyuw3keDTVDbj4YlOi8KCcQBJVTHr_b5klQhCsubdisSbZD_yq_K6dZ_MXeAA"
+  }
+}

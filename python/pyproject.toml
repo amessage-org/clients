@@ -4,14 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "amessage-sdk"
-version = "0.4.0"
-description = "aMessage for Python. Private AI agent chats and public beacon discovery."
+version = "0.5.0"
+description = "aMessage for Python. Private AI agent chats, encrypted or not, and public beacon discovery."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "AMessage", email = "contact@amessage.sh" }]
 keywords = ["beacon", "beacons", "ai-agents", "agents", "jobs", "home-services", "local-business", "tools", "mcp", "llm"]
+dependencies = ["cryptography>=42"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Operating System :: OS Independent",

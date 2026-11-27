@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { searchBeacons, amessageTools, readBeacon } from "@amessage/ai-sdk-tools";
 import { AMessage } from "@amessage/sdk";
+import * as e2e from "@amessage/sdk/e2e";
 import { asSchema } from "ai";
 
 /** A stand-in client that records what the tools ask it. */
@@ -152,6 +156,19 @@ test("the write tools share one client and call the matching method", async () =
       ["reportConversation", ID, "spam", { block: true, key: ID }],
     ],
     [
+      "reportConversation",
+      { conversationId: ID, reason: "abuse", reveal: [ID] },
+      ["reportConversation", ID, "abuse", { block: true, reveal: [ID] }],
+    ],
+    ["agentChat", { command: { action: "keys" } }, ["chat", { action: "keys" }]],
+    ["agentChat", { command: { action: "publish_keys" } }, ["chat", { action: "publish_keys" }]],
+    ["agentChat", { command: { action: "agent_keys", agent_id: ID } }, ["chat", { action: "agent_keys", agent_id: ID }]],
+    [
+      "agentChat",
+      { command: { action: "key_lookup", to: { email: "alex@example.com" } } },
+      ["chat", { action: "key_lookup", to: { email: "alex@example.com" } }],
+    ],
+    [
       "createBeacon",
       { text: "Open", location: null, key: ID, welcome_chat: false },
       ["create", "Open", { location: null, welcome_chat: false, idempotencyKey: ID }],
@@ -281,4 +298,98 @@ test("agentChat shows this agent, names it, and changes who may start a chat wit
   assert.deepEqual(calls.at(-1).body, { allow_from: "phone" });
   await run({ action: "set_preferences", new_contacts: "open", etag: '"5"' });
   assert.equal(calls.at(-2).method, "PATCH", "a given etag is used without reading again");
+});
+
+test("agentChat takes the key actions strictly, with no private key anywhere in them", async () => {
+  const { inputSchema } = amessageTools({ write: true, client: fakeClient() }).agentChat;
+  const ok = (command) => inputSchema.safeParse({ command }).success;
+  for (const good of [
+    { action: "keys" },
+    { action: "publish_keys" },
+    { action: "agent_keys", agent_id: ID },
+    { action: "key_lookup", to: { phone: "+14155550100" } },
+    { action: "key_lookup", to: { email: "alex@example.com" } },
+  ])
+    assert.equal(ok(good), true, JSON.stringify(good));
+  for (const bad of [
+    { action: "keys", agent_id: ID },
+    { action: "publish_keys", identity_key: "abc", private: "abc" },
+    { action: "agent_keys" },
+    { action: "agent_keys", agent_id: "abc" },
+    { action: "key_lookup", to: { beacon_id: ID } },
+    { action: "key_lookup", to: { phone: "+14155550100", email: "alex@example.com" } },
+    { action: "send", to: { agent_id: ID }, text: "Hi", plain: true },
+  ])
+    assert.equal(ok(bad), false, JSON.stringify(bad));
+  const json = await asSchema(inputSchema).jsonSchema;
+  const publish = json.properties.command.anyOf.find((b) => b.properties.action.const === "publish_keys");
+  assert.deepEqual(Object.keys(publish.properties), ["action"]);
+  assert.match(publish.description, /never leave this machine/);
+});
+
+test("with encryption on, agentChat's send seals on this machine and reading opens the reply", async () => {
+  const ME = "0d3b9c2e-5f4a-4b8e-9c1d-2a3b4c5d6e7f";
+  const BOB = "8f7e6d5c-4b3a-4291-8f7e-6d5c4b3a2918";
+  const CONVERSATION = "1a2b3c4d-5e6f-4a1b-8c2d-3e4f5a6b7c8d";
+  const bob = e2e.generateIdentity();
+  const bobKey = e2e.newMessageKey(bob.privateKey);
+  const bobKeys = {
+    agent_id: BOB,
+    identity_key: e2e.b64(bob.publicKey),
+    fingerprint: e2e.fingerprint(bob.publicKey),
+    message_key: bobKey.public,
+  };
+  let mine = null;
+  const posted = [];
+  const client = new AMessage({
+    token: "agt_test",
+    encryption: true,
+    env: { AMESSAGE_CONFIG_DIR: await mkdtemp(join(tmpdir(), "amessage-tools-")) },
+    fetch: async (url, init) => {
+      const path = new URL(url).pathname;
+      const body = init.body ? JSON.parse(init.body) : undefined;
+      if (path === "/v1/me") return Response.json({ agent_id: ME, inbox_id: ME, name: null, linked_to_account: false });
+      if (path === "/v1/me/keys" && init.method === "PUT") {
+        mine = { agent_id: ME, fingerprint: e2e.fingerprint(e2e.unb64(body.identity_key)), ...body };
+        return Response.json(mine);
+      }
+      if (path === `/v1/agents/${BOB}/keys`) return Response.json(bobKeys);
+      if (path === "/v1/messages") {
+        posted.push(body);
+        const message = { id: ID, conversation_id: CONVERSATION, sender_agent_id: ME, text: null, encrypted: body.encrypted };
+        return Response.json(message, { status: 201 });
+      }
+      if (path === `/v1/conversations/${CONVERSATION}/messages`) {
+        const encrypted = e2e.sealMessage({
+          text: "Thursday works.",
+          from: BOB,
+          to: ME,
+          identityPrivate: bob.privateKey,
+          identityPublic: bob.publicKey,
+          recipientKey: mine.message_key,
+        });
+        return Response.json({ data: [{ id: RETRY_KEY, sender_agent_id: BOB, text: null, encrypted }], next_cursor: null });
+      }
+      return Response.json({ code: "not_found" }, { status: 404 });
+    },
+  });
+  const tools = amessageTools({ client, write: true });
+  const chat = tools.agentChat;
+  const sent = await chat.execute(
+    chat.inputSchema.parse({ command: { action: "send", to: { agent_id: BOB }, text: "Is Thursday free?" } }),
+    context,
+  );
+  assert.equal(posted[0].text, undefined);
+  assert.equal(e2e.isEnvelope(posted[0].encrypted), true);
+  const payload = e2e.openMessage({
+    envelope: posted[0].encrypted,
+    messagePrivate: bobKey.privateKey,
+    senderIdentityPublic: e2e.unb64(mine.identity_key),
+    me: BOB,
+    sender: ME,
+  });
+  assert.equal(payload.text, "Is Thursday free?");
+  assert.deepEqual(sent.opened, { text: "Is Thursday free?", verified: true });
+  const page = await tools.readConversations.execute({ conversationId: CONVERSATION }, context);
+  assert.deepEqual(page.data[0].opened, { text: "Thursday works.", verified: true });
 });

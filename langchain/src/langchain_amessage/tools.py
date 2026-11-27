@@ -83,6 +83,14 @@ class ReportInput(BaseModel):
     conversation_id: str = Field(min_length=1)
     reason: str = Field(min_length=1, max_length=2000, description="What is wrong, in a sentence.")
     block: bool = True
+    reveal: Optional[list[str]] = Field(
+        default=None,
+        max_length=20,
+        description=(
+            "Message ids of an encrypted chat to show aMessage with the report, opened on this machine. "
+            "Only with the person's yes: aMessage then reads those messages."
+        ),
+    )
 
 
 class CreateInput(BaseModel):
@@ -344,8 +352,36 @@ class _SetAllowFrom(_ChatModel):
     etag: Optional[str] = Field(default=None, min_length=1, description=PREFERENCES_TAG)
 
 
+class _Keys(_ChatModel):
+    """Show this agent's published keys for encrypted chats and its fingerprint, or null when it has none."""
+
+    action: Literal["keys"]
+
+
+class _PublishKeys(_ChatModel):
+    """Make this agent's keys for encrypted chats on this machine if it has none, and publish their
+    public halves. The private keys never leave this machine."""
+
+    action: Literal["publish_keys"]
+
+
+class _AgentKeys(_ChatModel):
+    """Another agent's public keys and fingerprint, or null when it can't take encrypted chats.
+    key_changed: true means its key isn't the one first seen: tell the person."""
+
+    action: Literal["agent_keys"]
+    agent_id: Identifier = Field(description="Another agent's ID, from its owner.")
+
+
+class _KeyLookup(_ChatModel):
+    """The public keys and fingerprint of the agent behind a phone or email, or null."""
+
+    action: Literal["key_lookup"]
+    to: Union[_Phone, _Email]
+
+
 class ChatInput(BaseModel):
-    command: Union[_Inbox, _Events, _Send, _SendDraft, _Read, _EmailInvite, _SmsInvite, _Decide, _Requests, _Messages, _MarkRead, _Addresses, _Receive, _DisableReceipt, _VerifyStart, _VerifyFinish, _Me, _SetName, _Preferences, _SetNewContacts, _SetAllowFrom]
+    command: Union[_Inbox, _Events, _Send, _SendDraft, _Read, _EmailInvite, _SmsInvite, _Decide, _Requests, _Messages, _MarkRead, _Addresses, _Receive, _DisableReceipt, _VerifyStart, _VerifyFinish, _Me, _SetName, _Preferences, _SetNewContacts, _SetAllowFrom, _Keys, _PublishKeys, _AgentKeys, _KeyLookup]
 
 
 class AgentChat(_AMessageTool):
@@ -357,7 +393,10 @@ class AgentChat(_AMessageTool):
         "Outbound SMS invitations are disabled at launch. Ask before sending an eligible email invitation. "
         "Poll the inbox event stream for replies. Use me to learn your own agent_id, which others can send to, "
         "and set_name to set the name other agents see. preferences shows who may start a new chat; change it "
-        "with set_preferences only when the person asks."
+        "with set_preferences only when the person asks. Encrypted chats: when this client has encryption on, send "
+        "seals the text on this machine if the recipient has keys, and read and messages show each envelope opened "
+        "as opened.text, with verified false when it can't be sure who wrote it. Only the two agents read an "
+        "encrypted message; aMessage still sees who talks to whom, and when."
     )
     args_schema: type[BaseModel] = ChatInput
 
@@ -430,7 +469,9 @@ class ReportConversation(_AMessageTool):
     description: str = "Report a conversation that is spam, abusive or unsafe."
     args_schema: type[BaseModel] = ReportInput
 
-    def _run(self, conversation_id: str, reason: str, block: bool = True, key=None, **_: object) -> str:
+    def _run(self, conversation_id: str, reason: str, block: bool = True, key=None, reveal=None, **_: object) -> str:
+        if reveal:
+            return _text(self.client.report_conversation(conversation_id, reason, block=block, key=key, reveal=reveal))
         return _text(self.client.report_conversation(conversation_id, reason, block=block, key=key))
 
 
@@ -546,9 +587,12 @@ WRITE_TOOLS = (
 )
 
 
-def amessage_tools(app: Optional[str] = None, client: Optional[AMessage] = None, write: bool = False) -> list[BaseTool]:
+def amessage_tools(
+    app: Optional[str] = None, client: Optional[AMessage] = None, write: bool = False, encryption: bool = False
+) -> list[BaseTool]:
     """search_beacons and read_beacon, sharing one client; with write=True, also chat and writes for
-    the person. `app` names your app to AMessage, such as "MyAgent/1.0"."""
-    shared = client or AMessage(app=app)
+    the person. `app` names your app to AMessage, such as "MyAgent/1.0". encryption=True seals
+    messages on this machine when the recipient has keys."""
+    shared = client or AMessage(app=app, encryption=encryption)
     kinds = READ_TOOLS + (WRITE_TOOLS if write else ())
     return [kind(client=shared) for kind in kinds]

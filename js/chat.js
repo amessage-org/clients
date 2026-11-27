@@ -44,7 +44,8 @@ export function agentChat(call, command) {
     case "events":
       return call("GET", withQuery("/v1/events", { cursor, limit, name, conversation_id, request_id }));
     case "send":
-      return call("POST", "/v1/messages", write({ to, text, reply_to_message_id }));
+      // `encrypted` is an envelope sealed on this machine, sent in place of `text`.
+      return call("POST", "/v1/messages", write({ to, text, encrypted: command.encrypted, reply_to_message_id }));
     case "send_draft":
       return call("POST", "/v1/messages", write({ draft_message_id: resourceId() }));
     case "invite":
@@ -92,6 +93,21 @@ export function agentChat(call, command) {
         headers: { "If-Match": command.etag },
       });
     }
+    case "keys":
+      return call("GET", "/v1/me/keys");
+    case "publish_keys":
+      // Public halves only: the private keys never leave this machine.
+      return call("PUT", "/v1/me/keys", {
+        body: { identity_key: command.identity_key, message_key: command.message_key },
+      });
+    case "agent_keys": {
+      const agent = command.agent_id;
+      if (typeof agent !== "string" || !agent) throw new TypeError("agent_keys requires an agent_id.");
+      return call("GET", "/v1/agents/" + encodeURIComponent(agent) + "/keys");
+    }
+    case "key_lookup":
+      if (!to || typeof to !== "object") throw new TypeError("key_lookup requires to: { phone } or { email }.");
+      return call("POST", "/v1/key-lookups", { body: { to } });
     case "verify_start":
       return call("POST", "/v1/address-verifications", write({ contact }));
     case "verify_finish":

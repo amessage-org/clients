@@ -2,7 +2,7 @@ import json
 from uuid import UUID
 
 import pytest
-from amessage_sdk import AMessage
+from amessage_sdk import AMessage, e2e
 from pydantic import ValidationError
 
 from langchain_tests.unit_tests import ToolsUnitTests
@@ -86,6 +86,7 @@ def test_the_write_tools_share_one_client_and_call_the_matching_method():
         ("reply", {"conversation_id":"c","text":"Yes","reply_to_message_id":"m","key":"write"}, ("reply",("c","Yes"),{"reply_to_message_id":"m","key":"write"})),
         ("mark_outcome", {"message_id":"m","outcome":"booked"}, ("mark_outcome",("m","booked"),{})),
         ("report_conversation", {"conversation_id":"c","reason":"spam"}, ("report_conversation",("c","spam"),{"key":None,"block":True})),
+        ("report_conversation", {"conversation_id":"c","reason":"abuse","reveal":["m"]}, ("report_conversation",("c","abuse"),{"key":None,"block":True,"reveal":["m"]})),
         ("create_beacon", {"text":"Open","welcome_chat":False}, ("create",("Open",),{"location":None,"idempotency_key":None,"welcome_chat":False})),
         ("renew_beacon", {"beacon_id":"b","key":"write"}, ("renew",("b",),{"key":"write"})),
         ("renew_beacon", {"beacon_id":"b","location":None}, ("renew",("b",),{"location":None,"key":None})),
@@ -236,6 +237,71 @@ def test_agent_chat_schema_converts_for_tool_calling():
     schema = json.dumps(convert_to_openai_tool(AgentChat(client=FakeClient())))
     for action in ("me", "set_name", "preferences", "set_preferences"):
         assert f'"{action}"' in schema
+
+
+def test_agent_chat_passes_the_key_actions_with_no_private_key_in_them():
+    client = FakeClient()
+    tool = AgentChat(client=client)
+    for command in (
+        {"action": "keys"},
+        {"action": "publish_keys"},
+        {"action": "agent_keys", "agent_id": IDENT},
+        {"action": "key_lookup", "to": {"phone": "+14155550100"}},
+        {"action": "key_lookup", "to": {"email": "alex@example.com"}},
+    ):
+        assert json.loads(tool.invoke({"command": command})) == {"ok": True}
+        assert client.calls[-1] == ("chat", (command,), {}), command
+    for bad in (
+        {"action": "keys", "agent_id": IDENT},
+        {"action": "publish_keys", "identity_key": "abc", "private": "abc"},
+        {"action": "agent_keys"},
+        {"action": "agent_keys", "agent_id": "malformed"},
+        {"action": "key_lookup", "to": {"beacon_id": IDENT}},
+        {"action": "send", "to": {"agent_id": IDENT}, "text": "Hi", "plain": True},
+    ):
+        with pytest.raises(ValidationError):
+            tool.invoke({"command": bad})
+    assert len(client.calls) == 5
+    assert "Encrypted chats" in tool.description
+
+
+def test_with_encryption_on_agent_chat_seals_on_this_machine_and_reading_opens_the_reply(tmp_path):
+    me, bob_id, conversation = IDENT, "8f7e6d5c-4b3a-4291-8f7e-6d5c4b3a2918", "1a2b3c4d-5e6f-4a1b-8c2d-3e4f5a6b7c8d"
+    bob_private, bob_public = e2e.generate_identity()
+    bob_key_private, bob_key = e2e.new_message_key(bob_private)
+    bob_keys = {"agent_id": bob_id, "identity_key": e2e.b64(bob_public), "fingerprint": e2e.fingerprint(bob_public), "message_key": bob_key}
+    state = {"mine": None, "posted": []}
+
+    def send(method, url, headers, body):
+        path = url.removeprefix("https://example.invalid")
+        sent = json.loads(body) if body else None
+        if path == "/v1/me":
+            return 200, {}, json.dumps({"agent_id": me, "inbox_id": me, "name": None, "linked_to_account": False})
+        if path == "/v1/me/keys" and method == "PUT":
+            state["mine"] = {"agent_id": me, "fingerprint": e2e.fingerprint(e2e.unb64(sent["identity_key"])), **sent}
+            return 200, {}, json.dumps(state["mine"])
+        if path == f"/v1/agents/{bob_id}/keys":
+            return 200, {}, json.dumps(bob_keys)
+        if path == "/v1/messages":
+            state["posted"].append(sent)
+            return 201, {}, json.dumps({"id": IDENT, "conversation_id": conversation, "sender_agent_id": me, "text": None, "encrypted": sent["encrypted"]})
+        if path == f"/v1/conversations/{conversation}/messages":
+            reply = e2e.seal_message("Thursday works.", bob_id, me, bob_private, bob_public, state["mine"]["message_key"])
+            return 200, {}, json.dumps({"data": [{"id": bob_id, "sender_agent_id": bob_id, "text": None, "encrypted": reply}], "next_cursor": None})
+        return 404, {}, json.dumps({"code": "not_found", "detail": "No such path."})
+
+    client = AMessage(api_url="https://example.invalid", token="test", send=send, encryption=True, env={"AMESSAGE_CONFIG_DIR": str(tmp_path)})
+    tools = {t.name: t for t in amessage_tools(client=client, write=True)}
+    sent = json.loads(tools["agent_chat"].invoke({"command": {"action": "send", "to": {"agent_id": bob_id}, "text": "Is Thursday free?"}}))
+    [posted] = state["posted"]
+    assert "text" not in posted and e2e.is_envelope(posted["encrypted"])
+    payload = e2e.open_message(posted["encrypted"], bob_key_private, e2e.unb64(state["mine"]["identity_key"]), bob_id, me)
+    assert payload["text"] == "Is Thursday free?"
+    assert sent["opened"] == {"text": "Is Thursday free?", "verified": True}
+    page = json.loads(tools["read_conversations"].invoke({"conversation_id": conversation}))
+    assert page["data"][0]["opened"] == {"text": "Thursday works.", "verified": True}
+    assert (tmp_path / "keys.json").exists()
+    assert amessage_tools(write=True, encryption=True)[0].client.encryption is True
 
 
 class TestSearchBeaconsStandard(ToolsUnitTests):
