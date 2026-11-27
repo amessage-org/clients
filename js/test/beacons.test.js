@@ -136,6 +136,14 @@ describe("connecting", () => {
     assert.equal(api.calls.filter((c) => c.path === "/v1/agents").length, 1);
   });
 
+  it("sends the agent's name when it connects, if given one", async () => {
+    const api = fakeApi();
+    const { op } = await client(api, { name: " Build bot " });
+    await op.myBeacons();
+    assert.deepEqual(JSON.parse(api.calls[0].body), { name: "Build bot" });
+    assert.equal(api.calls[0].headers["Content-Type"], "application/json");
+  });
+
   it("reports a revoked private identity without creating a different agent", async () => {
     const api = fakeApi();
     const { op } = await client(api, { token: "agt_revoked" });

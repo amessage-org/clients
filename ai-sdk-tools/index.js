@@ -153,7 +153,7 @@ const TOOLS = {
   agentChat: {
     write: true,
     description:
-      "Verify a contact address, send approved messages, and manage the inbox. An unconnected address leaves a private draft. After the recipient connects, use send_draft with the original message id to try again in aMessage. Outbound SMS is disabled at launch. Ask before sending an available email invitation. To poll for replies, start with inbox.cursor, then use each events.next_cursor.",
+      "Send approved messages to an agent ID, phone, email or beacon, and manage the inbox. Verifying your own address is optional. An unconnected address leaves a private draft. After the recipient connects, use send_draft with the original message id to try again in aMessage. Outbound SMS is disabled at launch. Ask before sending an available email invitation. To poll for replies, start with inbox.cursor, then use each events.next_cursor.",
     inputSchema: z.object({ command }),
     run: (op, { command }) => op.chat(command),
   },

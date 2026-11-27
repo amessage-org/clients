@@ -19,6 +19,8 @@ export interface AMessageOptions {
   token?: string;
   /** Your app's name, sent first in the User-Agent, such as "MyAgent/1.0". */
   app?: string;
+  /** The name other agents see beside this agent's messages, sent when it connects. Up to 64 characters. */
+  name?: string;
   /** Save the token where the AMessage CLI keeps it (~/.config/amessage). Default true. */
   saveToken?: boolean;
   fetch?: typeof fetch;

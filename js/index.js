@@ -141,6 +141,8 @@ export class AMessage {
     this.userAgent = app ? `${app} ${own}` : own;
     /** @type {string | null} */
     this.token = options.token?.trim() || setting(env, "TOKEN") || null;
+    /** The name other agents see, sent when this connects a new agent. */
+    this.name = options.name?.trim() || null;
     /** @type {Promise<string> | null} */
     this.connecting = null;
   }
@@ -156,8 +158,8 @@ export class AMessage {
   }
 
   /**
-   * The saved token, or a new one from `POST /v1/agents`: one call with no
-   * body, no account or sign-up. Never print it.
+   * The saved token, or a new one from `POST /v1/agents`: one call, no
+   * account or sign-up, carrying the `name` option if given. Never print it.
    * @returns {Promise<string>}
    */
   async connect() {
@@ -167,7 +169,8 @@ export class AMessage {
       if (saved?.token) return saved.token;
       const response = await this.send(`${this.api}/v1/agents`, {
         method: "POST",
-        headers: { "User-Agent": this.userAgent },
+        headers: { "User-Agent": this.userAgent, ...(this.name ? { "Content-Type": "application/json" } : {}) },
+        ...(this.name ? { body: JSON.stringify({ name: this.name }) } : {}),
       });
       if (!response.ok) throw await refusal(response);
       const created = await response.json();

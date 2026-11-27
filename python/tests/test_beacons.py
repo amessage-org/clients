@@ -128,6 +128,14 @@ class ConnectingTest(ClientTest):
         AMessage(send=api, env={}, home=home).my_beacons()
         self.assertEqual(api.connects(), 1)
 
+    def test_sends_the_agent_name_when_it_connects(self):
+        api = FakeApi()
+        home = Path(tempfile.mkdtemp())
+        AMessage(send=api, env={}, home=home, name=" Build bot ").my_beacons()
+        method, path, headers, body = api.calls[0]
+        self.assertEqual((path, body), ("/v1/agents", {"name": "Build bot"}))
+        self.assertEqual(headers["Content-Type"], "application/json")
+
     def test_private_refusal_keeps_the_original_identity(self):
         api = FakeApi()
         _, op = self.client(api, token="agt_revoked")

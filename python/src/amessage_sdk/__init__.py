@@ -188,8 +188,11 @@ class AMessage:
         send: Send | None = None,
         env: dict | None = None,
         home: Path | None = None,
+        name: str | None = None,
     ):
         env = dict(os.environ) if env is None else env
+        # The name other agents see, sent when this connects a new agent.
+        self.name = (name or "").strip() or None
         self.api = (api_url or _setting(env, "API_URL") or DEFAULT_API).rstrip("/")
         self.send = send or _urllib_send
         self.save = save_token
@@ -209,8 +212,8 @@ class AMessage:
             return saved.get("token") or None
 
     def connect(self) -> str:
-        """The saved token, or a new one from POST /v1/agents: one call with no body,
-        no account or sign-up. Never print it."""
+        """The saved token, or a new one from POST /v1/agents: one call, no account
+        or sign-up, carrying the name if given. Never print it."""
         with self._lock:
             if self.token:
                 return self.token
@@ -218,8 +221,12 @@ class AMessage:
             if saved.get("token"):
                 self.token = saved["token"]
                 return self.token
+            named = {"name": self.name} if self.name else None
             status, headers, text = self.send(
-                "POST", f"{self.api}/v1/agents", {"User-Agent": self.user_agent}, None
+                "POST",
+                f"{self.api}/v1/agents",
+                {"User-Agent": self.user_agent, **({"Content-Type": "application/json"} if named else {})},
+                None if named is None else json.dumps(named).encode("utf-8"),
             )
             if not 200 <= status < 300:
                 raise _refusal(status, headers, text)
