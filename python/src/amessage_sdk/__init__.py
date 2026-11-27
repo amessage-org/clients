@@ -88,7 +88,8 @@ class AMessageError(Exception):
 
 class EncryptionError(Exception):
     """Something on this machine stopped an encrypted chat. `code` says which: no_keys (this agent
-    or the recipient has none), key_changed (the recipient's fingerprint isn't the one first seen;
+    or the recipient has none), keys_elsewhere (this agent's keys are on another machine; move them
+    here, or create_keys(replace=True)), key_changed (the recipient's fingerprint isn't the one first seen;
     call trust_key once the person compared it), bad_keys (published keys don't check),
     fingerprint_mismatch (trust_key was given another fingerprint) or cant_open (a message to reveal
     couldn't be opened)."""
@@ -587,11 +588,31 @@ class AMessage:
         message_key = {field: k[field] for field in ("key_id", "public_key", "expires_at", "signature")}
         return self.call("PUT", "/v1/me/keys", body={"identity_key": entry["identity"]["public"], "message_key": message_key})
 
+    def _mine_on_server(self, entry: dict | None) -> None:
+        """Refuse to publish over an identity another machine holds: GET /v1/me says the agent's
+        current fingerprint whenever it has one, even when its message key lapsed."""
+        me = self.call("GET", "/v1/me") or {}
+        theirs = (me.get("encryption") or {}).get("fingerprint")
+        if not theirs:
+            return
+        if entry and e2e.fingerprint(e2e.unb64(entry["identity"]["public"])) == theirs:
+            return
+        raise EncryptionError(
+            "keys_elsewhere",
+            "This agent's keys are on another machine. Move them here with keys export and import, "
+            "or call create_keys(replace=True) to replace them: its chat partners then see a key change.",
+            agent_id=me.get("agent_id"),
+            fingerprint=theirs,
+        )
+
     def create_keys(self, replace: bool = False) -> dict:
         """Make this agent's keys for encrypted chats on this machine, if it has none, and publish
-        their public halves. The private keys stay in keys.json. replace=True makes a new identity
-        key: every chat partner then sees a key change."""
+        their public halves. The private keys stay in keys.json. Raises EncryptionError keys_elsewhere
+        when the agent's keys are on another machine. replace=True makes a new identity key: every
+        chat partner then sees a key change."""
         me = self._me()
+        if not replace:
+            self._mine_on_server(self._entry()[1])
 
         def change(everything: dict) -> dict:
             agents = everything.setdefault(self.api, {})
@@ -613,7 +634,10 @@ class AMessage:
 
     def rotate_keys(self) -> dict:
         """Make the next week's message key and publish it. Old private message keys stay for 180 days."""
-        me = self._me()
+        me, local = self._entry()
+        if local is None:
+            return self.create_keys()
+        self._mine_on_server(local)
 
         def change(everything: dict):
             entry = (everything.get(self.api) or {}).get(me)

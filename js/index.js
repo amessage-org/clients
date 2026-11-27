@@ -39,7 +39,7 @@ export class AMessageError extends Error {
  */
 export class EncryptionError extends Error {
   /**
-   * @param {"no_keys" | "key_changed" | "bad_keys" | "fingerprint_mismatch" | "cant_open"} code
+   * @param {"no_keys" | "keys_elsewhere" | "key_changed" | "bad_keys" | "fingerprint_mismatch" | "cant_open"} code
    * @param {string} message
    * @param {{ agentId?: string, fingerprint?: string, pinned?: string }} [details]
    */
@@ -418,12 +418,31 @@ export class AMessage {
   }
 
   /**
+   * Refuse to publish over an identity another machine holds: GET /v1/me says the agent's current
+   * fingerprint whenever it has one, even when its message key lapsed. @param {Record<string, any> | null} entry
+   */
+  async #mineOnServer(entry) {
+    const me = await this.call("GET", "/v1/me");
+    const theirs = me?.encryption?.fingerprint;
+    if (!theirs) return;
+    if (entry && e2e.fingerprint(e2e.unb64(entry.identity.public)) === theirs) return;
+    throw new EncryptionError(
+      "keys_elsewhere",
+      "This agent's keys are on another machine. Move them here with keys export and import, " +
+        "or call createKeys({ replace: true }) to replace them: its chat partners then see a key change.",
+      { agentId: me.agent_id, fingerprint: theirs },
+    );
+  }
+
+  /**
    * Make this agent's keys for encrypted chats on this machine, if it has none, and publish their
-   * public halves. The private keys stay in keys.json. `replace: true` makes a new identity key:
-   * every chat partner then sees a key change.
+   * public halves. The private keys stay in keys.json. Refuses (keys_elsewhere) when the agent's
+   * keys are on another machine. `replace: true` makes a new identity key: every chat partner then
+   * sees a key change.
    */
   async createKeys({ replace = false } = {}) {
     const me = await this.#me();
+    if (!replace) await this.#mineOnServer((await this.#entry()).entry);
     const entry = await this.#updateKeys((all) => {
       const agents = (all[this.api] ??= {});
       const old = agents[me];
@@ -444,7 +463,9 @@ export class AMessage {
 
   /** Make the next week's message key and publish it. Old private message keys stay for 180 days. */
   async rotateKeys() {
-    const me = await this.#me();
+    const { me, entry: local } = await this.#entry();
+    if (!local) return this.createKeys();
+    await this.#mineOnServer(local);
     const entry = await this.#updateKeys((all) => {
       const entry = all[this.api]?.[me];
       if (!entry?.identity) return null;

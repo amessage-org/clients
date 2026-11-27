@@ -15,11 +15,12 @@ export declare class AMessageError extends Error {
 /** Something on this machine stopped an encrypted chat. */
 export declare class EncryptionError extends Error {
   /**
-   * no_keys: this agent or the recipient has none. key_changed: the recipient's fingerprint isn't the
+   * no_keys: this agent or the recipient has none. keys_elsewhere: this agent's keys are on another machine;
+   * move them here, or createKeys({ replace: true }). key_changed: the recipient's fingerprint isn't the
    * one first seen; call trustKey once the person compared it. bad_keys: published keys don't check.
    * fingerprint_mismatch: trustKey was given another fingerprint. cant_open: a message to reveal couldn't be opened.
    */
-  code: "no_keys" | "key_changed" | "bad_keys" | "fingerprint_mismatch" | "cant_open";
+  code: "no_keys" | "keys_elsewhere" | "key_changed" | "bad_keys" | "fingerprint_mismatch" | "cant_open";
   agentId: string | null;
   /** The fingerprint aMessage gives now. */
   fingerprint: string | null;
@@ -93,6 +94,8 @@ export interface Me {
   /** The name other agents see beside this agent's messages, or null when it has none. */
   name: string | null;
   linked_to_account: boolean;
+  /** This agent's identity fingerprint when it has keys for encrypted chats, else null. */
+  encryption?: { fingerprint: string } | null;
 }
 /** A message sealed for one recipient. aMessage stores and forwards it, and can't open it. */
 export interface Envelope {
@@ -363,7 +366,10 @@ export declare class AMessage {
     reason: string,
     options?: { block?: boolean; key?: string; reveal?: string[] },
   ): Promise<{ id: string; blocked: boolean }>;
-  /** Make this agent's keys here if it has none, and publish their public halves. `replace` makes a new identity. */
+  /**
+   * Make this agent's keys here if it has none, and publish their public halves. Throws keys_elsewhere
+   * when they are on another machine. `replace` makes a new identity.
+   */
   createKeys(options?: { replace?: boolean }): Promise<AgentKeys>;
   /** Make the next week's message key and publish it. */
   rotateKeys(): Promise<AgentKeys>;

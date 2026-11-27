@@ -170,13 +170,15 @@ class FakeServer:
     def __init__(self):
         self.tokens, self.keys, self.phones = {}, {}, {}
         self.conversations, self.messages, self.reports, self.calls, self.refuse_next = {}, {}, [], [], []
+        # Agents whose weekly message key lapsed: no keys to seal to, but an identity still.
+        self.lapsed = set()
 
     @staticmethod
     def problem(status, code):
         return status, {}, json.dumps({"code": code, "detail": f"Refused: {code}."})
 
     def published(self, agent_id):
-        k = self.keys.get(agent_id)
+        k = None if agent_id in self.lapsed else self.keys.get(agent_id)
         if not k:
             return None
         return {"agent_id": agent_id, "identity_key": k["identity_key"], "fingerprint": k["fingerprint"], "message_key": k["message_keys"][-1]}
@@ -204,7 +206,8 @@ class FakeServer:
         if not me:
             return self.problem(401, "connect_first")
         if path == "/v1/me":
-            return self.ok({"agent_id": me, "inbox_id": me, "name": None, "linked_to_account": False})
+            encryption = {"fingerprint": self.keys[me]["fingerprint"]} if me in self.keys else None
+            return self.ok({"agent_id": me, "inbox_id": me, "name": None, "linked_to_account": False, "encryption": encryption})
         if path == "/v1/me/keys" and method == "PUT":
             fp = e2e.fingerprint(e2e.unb64(body["identity_key"]))
             if not e2e.check_keys({**body, "fingerprint": fp}):
@@ -214,9 +217,10 @@ class FakeServer:
                 self.keys[me] = {"identity_key": body["identity_key"], "fingerprint": fp, "message_keys": [body["message_key"]]}
             elif before["message_keys"][-1]["key_id"] != body["message_key"]["key_id"]:
                 before["message_keys"].append(body["message_key"])
+            self.lapsed.discard(me)
             return self.ok(self.published(me))
         if path == "/v1/me/keys":
-            return self.ok(self.published(me)) if me in self.keys else self.problem(404, "not_found")
+            return self.ok(self.published(me)) if self.published(me) else self.problem(404, "not_found")
         parts = path.strip("/").split("/")
         if len(parts) == 4 and parts[1] == "agents" and parts[3] == "keys":
             answer = self.published(parts[2])
@@ -361,6 +365,40 @@ class EncryptedChatTest(unittest.TestCase):
             e = who.entry()
             for secret in [e["identity"]["private"], *(k["private"] for k in e["message_keys"])]:
                 self.assertNotIn(secret, wire)
+
+    def test_wont_publish_over_keys_another_machine_holds_even_when_their_message_key_lapsed(self):
+        server = FakeServer()
+        first, bob = Agent(server, encryption=True), Agent(server, encryption=True)
+        first.op.create_keys()
+        bob.op.create_keys()
+        original = server.keys[first.id]["fingerprint"]
+        server.lapsed.add(first.id)
+        second = AMessage(send=server, env={}, home=Path(tempfile.mkdtemp()), token=f"agt_{first.id}", encryption=True)
+        self.assertIsNone(second.keys(), "GET /v1/me/keys says nothing once the message key lapsed")
+        before = len(server.puts())
+        with self.assertRaises(EncryptionError) as caught:
+            second.create_keys()
+        self.assertEqual((caught.exception.code, caught.exception.fingerprint), ("keys_elsewhere", original))
+        self.assertIn("on another machine", str(caught.exception))
+        self.assertIn("replace=True", str(caught.exception))
+        for attempt in (
+            lambda: second.send_message({"agent_id": bob.id}, "Hi"),
+            lambda: second.chat({"action": "publish_keys"}),
+            second.rotate_keys,
+        ):
+            with self.assertRaises(EncryptionError) as refused:
+                attempt()
+            self.assertEqual(refused.exception.code, "keys_elsewhere")
+        self.assertEqual(len(server.puts()), before, "nothing was published")
+        self.assertEqual(server.keys[first.id]["fingerprint"], original)
+        self.assertEqual(first.op.rotate_keys()["fingerprint"], original, "the machine that holds them publishes as before")
+        replaced = second.create_keys(replace=True)
+        self.assertNotEqual(replaced["fingerprint"], original)
+        for attempt in (first.op.rotate_keys, first.op.create_keys):
+            with self.assertRaises(EncryptionError) as refused:
+                attempt()
+            self.assertEqual(refused.exception.code, "keys_elsewhere")
+        self.assertEqual(server.keys[first.id]["fingerprint"], replaced["fingerprint"])
 
     def test_sends_plain_when_it_should_and_refuses_plain_only_where_it_must(self):
         server = FakeServer()

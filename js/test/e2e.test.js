@@ -160,9 +160,11 @@ function fakeServer() {
   const reports = [];
   const calls = [];
   const refuseNext = [];
+  // Agents whose weekly message key lapsed: no keys to seal to, but an identity still.
+  const lapsed = new Set();
   const problem = (status, code) => Response.json({ code, detail: `Refused: ${code}.` }, { status });
   const published = (agentId) => {
-    const k = keys.get(agentId);
+    const k = lapsed.has(agentId) ? null : keys.get(agentId);
     return k && { agent_id: agentId, identity_key: k.identity_key, fingerprint: k.fingerprint, message_key: k.message_keys.at(-1) };
   };
   const chatBetween = (a, b) => {
@@ -185,7 +187,10 @@ function fakeServer() {
     }
     const me = tokens.get((init.headers?.Authorization ?? "").replace("Bearer ", ""));
     if (!me) return problem(401, "connect_first");
-    if (path === "/v1/me") return Response.json({ agent_id: me, inbox_id: me, name: null, linked_to_account: false });
+    if (path === "/v1/me") {
+      const encryption = keys.has(me) ? { fingerprint: keys.get(me).fingerprint } : null;
+      return Response.json({ agent_id: me, inbox_id: me, name: null, linked_to_account: false, encryption });
+    }
     if (path === "/v1/me/keys" && method === "PUT") {
       const fingerprint = e2e.fingerprint(e2e.unb64(body.identity_key));
       if (!e2e.checkKeys({ ...body, fingerprint })) return problem(422, "invalid_keys");
@@ -193,9 +198,10 @@ function fakeServer() {
       if (!before || before.identity_key !== body.identity_key)
         keys.set(me, { identity_key: body.identity_key, fingerprint, message_keys: [body.message_key] });
       else if (before.message_keys.at(-1).key_id !== body.message_key.key_id) before.message_keys.push(body.message_key);
+      lapsed.delete(me);
       return Response.json(published(me));
     }
-    if (path === "/v1/me/keys") return keys.has(me) ? Response.json(published(me)) : problem(404, "not_found");
+    if (path === "/v1/me/keys") return published(me) ? Response.json(published(me)) : problem(404, "not_found");
     const agentKeys = path.match(/^\/v1\/agents\/([^/]+)\/keys$/);
     if (agentKeys) {
       const answer = published(decodeURIComponent(agentKeys[1]));
@@ -265,7 +271,7 @@ function fakeServer() {
     }
     return problem(404, "not_found");
   };
-  return { fetch, calls, keys, phones, conversations, messages, reports, refuseNext };
+  return { fetch, calls, keys, phones, conversations, messages, reports, refuseNext, lapsed };
 }
 
 async function agent(server, options = {}) {
@@ -348,6 +354,47 @@ describe("encrypted chats between two agents", () => {
     }
     const wire = JSON.stringify(server.calls.map((c) => c.body ?? null));
     for (const secret of privates) assert.equal(wire.includes(secret), false);
+  });
+
+  it("won't publish over keys another machine holds, even when their message key lapsed, unless told to replace them", async () => {
+    const server = fakeServer();
+    const first = await agent(server, { encryption: true });
+    const bob = await agent(server, { encryption: true });
+    await first.op.createKeys();
+    await bob.op.createKeys();
+    const original = server.keys.get(first.id).fingerprint;
+    server.lapsed.add(first.id);
+    const second = new AMessage({
+      fetch: server.fetch,
+      env: {},
+      home: await mkdtemp(join(tmpdir(), "amessage-e2e-")),
+      token: `agt_${first.id}`,
+      encryption: true,
+    });
+    assert.equal(await second.keys(), null, "GET /v1/me/keys says nothing once the message key lapsed");
+    const puts = () => server.calls.filter((c) => c.method === "PUT" && c.path === "/v1/me/keys").length;
+    const before = puts();
+    await assert.rejects(second.createKeys(), (error) => {
+      assert.ok(error instanceof EncryptionError);
+      assert.equal(error.code, "keys_elsewhere");
+      assert.equal(error.fingerprint, original);
+      assert.match(error.message, /on another machine/);
+      assert.match(error.message, /replace: true/);
+      return true;
+    });
+    await assert.rejects(second.sendMessage({ agent_id: bob.id }, "Hi"), { code: "keys_elsewhere" });
+    await assert.rejects(second.chat({ action: "publish_keys" }), { code: "keys_elsewhere" });
+    await assert.rejects(second.rotateKeys(), { code: "keys_elsewhere" });
+    assert.equal(puts(), before, "nothing was published");
+    assert.equal(server.keys.get(first.id).fingerprint, original);
+    // The machine that holds them publishes as before.
+    assert.equal((await first.op.rotateKeys()).fingerprint, original);
+    // replace: true takes them over, and then the first machine can't take them back unasked.
+    const replaced = await second.createKeys({ replace: true });
+    assert.notEqual(replaced.fingerprint, original);
+    await assert.rejects(first.op.rotateKeys(), { code: "keys_elsewhere" });
+    await assert.rejects(first.op.createKeys(), { code: "keys_elsewhere" });
+    assert.equal(server.keys.get(first.id).fingerprint, replaced.fingerprint);
   });
 
   it("sends plain with plain: true or to an agent with no keys, and refuses plain only where it must", async () => {
