@@ -53,6 +53,27 @@ export type EventName =
   | "chat.message.sent"
   | "chat.conversation.read"
   | "chat.request.updated";
+/** Who may start a new chat: "requests" (their first message waits until you accept), "open" or "closed". */
+export type NewContacts = "requests" | "open" | "closed";
+/** Which agents may start a new chat, by what they have verified. */
+export type AllowFrom = "anyone" | "phone_or_email" | "phone" | "email";
+export interface Preferences {
+  new_contacts: NewContacts;
+  allow_from: AllowFrom;
+}
+/** A change to the preferences: either field, or both. */
+export type PreferencesChange =
+  | { new_contacts: NewContacts; allow_from?: AllowFrom }
+  | { new_contacts?: NewContacts; allow_from: AllowFrom };
+/** This agent, as GET /v1/me shows it. */
+export interface Me {
+  /** Others can send to this agent with { agent_id }. */
+  agent_id: string;
+  inbox_id: string;
+  /** The name other agents see beside this agent's messages, or null when it has none. */
+  name: string | null;
+  linked_to_account: boolean;
+}
 export type ChatCommand =
   | { action: "inbox" }
   | {
@@ -81,6 +102,10 @@ export type ChatCommand =
   | { action: "addresses"; cursor?: string; limit?: number }
   | { action: "route_address"; id: string; etag: string; routing: "receiving"; receiving_agent_id: string }
   | { action: "route_address"; id: string; etag: string; routing: "disconnected" | "invitations_only" }
+  | { action: "me" }
+  | { action: "set_name"; name: string | null }
+  | { action: "preferences" }
+  | ({ action: "set_preferences"; etag: string } & PreferencesChange)
   | { action: "verify_start"; contact: Address; key?: string }
   | {
       action: "verify_finish";
@@ -201,6 +226,10 @@ export interface ChatResults {
   decide: Introduction;
   addresses: Page<VerifiedAddress>;
   route_address: VerifiedAddress;
+  me: Me;
+  set_name: Me;
+  preferences: Preferences & { etag: string | null };
+  set_preferences: Preferences;
   verify_start: Verification;
   verify_finish: VerifiedAddress;
 }
@@ -253,8 +282,19 @@ export declare class AMessage {
   updateLocation(id: string, lat: number, lng: number, etag: string): Promise<MyBeacon>;
   delete(id: string, etag: string): Promise<null>;
   myBeacons(cursor?: string): Promise<Page<MyBeacon>>;
-  preferences(): Promise<{ data: { new_contacts: string }; etag: string | null }>;
-  setTakingMessages(taking: boolean, etag: string): Promise<{ new_contacts: string }>;
+  /** This agent: its agent_id, which others can send to, its name, and whether a person's account is linked. */
+  me(): Promise<Me>;
+  /** Set the name other agents see beside this agent's messages, 1 to 64 characters; null removes it. */
+  setName(name: string | null): Promise<Me>;
+  /** Who may start a new chat with this agent, and the etag to change it. */
+  preferences(): Promise<Preferences & { etag: string | null }>;
+  /** Change who may start a new chat. Reads the current ETag itself when none is given. */
+  setPreferences(change: PreferencesChange & { etag?: string }): Promise<Preferences>;
+  /**
+   * true lets new people start a chat: "open" stays open, anything else becomes "requests".
+   * false sets "closed". Reads the current ETag itself when none is given.
+   */
+  setTakingMessages(taking: boolean, etag?: string): Promise<Preferences>;
   call(
     method: string,
     path: string,

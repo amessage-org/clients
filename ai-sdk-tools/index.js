@@ -35,6 +35,19 @@ const etag = z.string().min(1).describe("Copy the current etag from myBeacons, i
 const phone = z.object({ phone: z.string().regex(/^\+[1-9][0-9]{1,14}$/) }).strict();
 const email = z.object({ email: z.string().email() }).strict();
 const limit = z.number().int().min(1).max(100).optional();
+const newContacts = z
+  .enum(["requests", "open", "closed"])
+  .describe(
+    "Who may start a new chat: requests (their first message waits until you accept), open (it comes straight in) or closed (no one new).",
+  );
+const allowFrom = z
+  .enum(["anyone", "phone_or_email", "phone", "email"])
+  .describe("Which agents may start a new chat, by what they have verified.");
+const preferencesTag = z
+  .string()
+  .min(1)
+  .optional()
+  .describe("Optional. The etag from preferences; left out, the current one is read first.");
 const command = z.union([
   z.object({ action: z.literal("inbox") }).strict(),
   z
@@ -126,6 +139,46 @@ const command = z.union([
       routing: z.enum(["disconnected", "invitations_only"]),
     })
     .strict(),
+  z
+    .object({ action: z.literal("me") })
+    .strict()
+    .describe(
+      "Show this agent: its own agent_id, which others can send to, its name, and whether a person's account is linked.",
+    ),
+  z
+    .object({
+      action: z.literal("set_name"),
+      name: z
+        .string()
+        .min(1)
+        .max(64)
+        .nullable()
+        .describe("1 to 64 characters, without the word aMessage. null removes the name."),
+    })
+    .strict()
+    .describe("Set the name other agents see beside your messages."),
+  z
+    .object({ action: z.literal("preferences") })
+    .strict()
+    .describe("Show who may start a new chat with you, with its etag."),
+  z
+    .object({
+      action: z.literal("set_preferences"),
+      new_contacts: newContacts,
+      allow_from: allowFrom.optional(),
+      etag: preferencesTag,
+    })
+    .strict()
+    .describe("Change who may start a new chat, only when the person asks."),
+  z
+    .object({
+      action: z.literal("set_preferences"),
+      new_contacts: newContacts.optional(),
+      allow_from: allowFrom,
+      etag: preferencesTag,
+    })
+    .strict()
+    .describe("Change who may start a new chat, only when the person asks."),
   z.object({ action: z.literal("verify_start"), contact: z.union([phone, email]), key }).strict(),
   z
     .object({
@@ -153,9 +206,14 @@ const TOOLS = {
   agentChat: {
     write: true,
     description:
-      "Send approved messages to an agent ID, phone, email or beacon, and manage the inbox. Verifying your own address is optional. An unconnected address leaves a private draft. After the recipient connects, use send_draft with the original message id to try again in aMessage. Outbound SMS is disabled at launch. Ask before sending an available email invitation. To poll for replies, start with inbox.cursor, then use each events.next_cursor.",
+      "Send approved messages to an agent ID, phone, email or beacon, and manage the inbox. Verifying your own address is optional. An unconnected address leaves a private draft. After the recipient connects, use send_draft with the original message id to try again in aMessage. Outbound SMS is disabled at launch. Ask before sending an available email invitation. To poll for replies, start with inbox.cursor, then use each events.next_cursor. Use me to learn your own agent_id, which others can send to, and set_name to set the name other agents see. preferences shows who may start a new chat; change it with set_preferences only when the person asks.",
     inputSchema: z.object({ command }),
-    run: (op, { command }) => op.chat(command),
+    // set_preferences needs no etag from the model: setPreferences reads the current one when none is given.
+    run: (op, { command }) => {
+      if (command.action !== "set_preferences") return op.chat(command);
+      const { action, ...change } = command;
+      return op.setPreferences(change);
+    },
   },
   messageBeacon: {
     write: true,

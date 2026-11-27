@@ -190,6 +190,10 @@ class _Beacon(_ChatModel):
     beacon_id: Identifier
 
 
+class _Agent(_ChatModel):
+    agent_id: Identifier = Field(description="Another agent's ID, from its owner.")
+
+
 class _Inbox(_ChatModel):
     action: Literal["inbox"]
 
@@ -212,7 +216,7 @@ class _Write(_ChatModel):
 
 class _Send(_Write):
     action: Literal["send"]
-    to: Union[_Phone, _Email, _Conversation, _Beacon]
+    to: Union[_Phone, _Email, _Conversation, _Beacon, _Agent]
     text: str = Field(min_length=1, max_length=2000)
     reply_to_message_id: Optional[Identifier] = None
 
@@ -291,22 +295,84 @@ class _VerifyFinish(_Write):
     routing: Optional[Literal["receiving", "invitations_only"]] = None
 
 
+class _Me(_ChatModel):
+    """Show this agent: its own agent_id, which others can send to, its name, and whether a person's account is linked."""
+
+    action: Literal["me"]
+
+
+class _SetName(_ChatModel):
+    """Set the name other agents see beside your messages."""
+
+    action: Literal["set_name"]
+    name: Optional[str] = Field(
+        min_length=1, max_length=64, description="1 to 64 characters, without the word aMessage. null removes the name."
+    )
+
+
+class _Preferences(_ChatModel):
+    """Show who may start a new chat with you, with its etag."""
+
+    action: Literal["preferences"]
+
+
+NEW_CONTACTS = (
+    "Who may start a new chat: requests (their first message waits until you accept), open (it comes straight in) "
+    "or closed (no one new)."
+)
+ALLOW_FROM = "Which agents may start a new chat, by what they have verified."
+PREFERENCES_TAG = "Optional. The etag from preferences; left out, the current one is read first."
+NewContacts = Literal["requests", "open", "closed"]
+AllowFrom = Literal["anyone", "phone_or_email", "phone", "email"]
+
+
+class _SetNewContacts(_ChatModel):
+    """Change who may start a new chat, only when the person asks."""
+
+    action: Literal["set_preferences"]
+    new_contacts: NewContacts = Field(description=NEW_CONTACTS)
+    allow_from: Optional[AllowFrom] = Field(default=None, description=ALLOW_FROM)
+    etag: Optional[str] = Field(default=None, min_length=1, description=PREFERENCES_TAG)
+
+
+class _SetAllowFrom(_ChatModel):
+    """Change who may start a new chat, only when the person asks."""
+
+    action: Literal["set_preferences"]
+    new_contacts: Optional[NewContacts] = Field(default=None, description=NEW_CONTACTS)
+    allow_from: AllowFrom = Field(description=ALLOW_FROM)
+    etag: Optional[str] = Field(default=None, min_length=1, description=PREFERENCES_TAG)
+
+
 class ChatInput(BaseModel):
-    command: Union[_Inbox, _Events, _Send, _SendDraft, _Read, _EmailInvite, _SmsInvite, _Decide, _Requests, _Messages, _MarkRead, _Addresses, _Receive, _DisableReceipt, _VerifyStart, _VerifyFinish]
+    command: Union[_Inbox, _Events, _Send, _SendDraft, _Read, _EmailInvite, _SmsInvite, _Decide, _Requests, _Messages, _MarkRead, _Addresses, _Receive, _DisableReceipt, _VerifyStart, _VerifyFinish, _Me, _SetName, _Preferences, _SetNewContacts, _SetAllowFrom]
 
 
 class AgentChat(_AMessageTool):
     name: str = "agent_chat"
     description: str = (
-        "Send approved messages and inspect their state. A draft stays private to the sender. "
+        "Send approved messages to an agent ID, phone, email or beacon, and inspect their state. "
+        "A draft stays private to the sender. "
         "When asked to try again, use send_draft with the original message id to retry inside aMessage. "
         "Outbound SMS invitations are disabled at launch. Ask before sending an eligible email invitation. "
-        "Poll the inbox event stream for replies."
+        "Poll the inbox event stream for replies. Use me to learn your own agent_id, which others can send to, "
+        "and set_name to set the name other agents see. preferences shows who may start a new chat; change it "
+        "with set_preferences only when the person asks."
     )
     args_schema: type[BaseModel] = ChatInput
 
     def _run(self, command: _ChatModel, **_: object) -> str:
-        return _text(self.client.chat(command.model_dump(exclude_none=True)))
+        if isinstance(command, (_SetNewContacts, _SetAllowFrom)):
+            # No etag needed from the model: set_preferences reads the current one when none is given.
+            return _text(
+                self.client.set_preferences(
+                    new_contacts=command.new_contacts, allow_from=command.allow_from, etag=command.etag
+                )
+            )
+        sent = command.model_dump(exclude_none=True)
+        if isinstance(command, _SetName):
+            sent["name"] = command.name  # None removes the name, so it is sent too.
+        return _text(self.client.chat(sent))
 
 
 class MessageBeacon(_AMessageTool):

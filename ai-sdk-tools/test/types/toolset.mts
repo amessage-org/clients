@@ -31,3 +31,21 @@ export async function privateInbox(agent: AMessage) {
   }
   return { events };
 }
+
+export function choosePreferences(): ChatInput[] {
+  return [
+    { command: { action: "me" } },
+    { command: { action: "set_name", name: null } },
+    { command: { action: "set_preferences", allow_from: "phone" } },
+  ];
+}
+
+export async function settings(agent: AMessage) {
+  const me = await agent.me();
+  const named = await agent.setName(me.name ?? "Trip planner");
+  const current = await agent.preferences();
+  const viaChat = await agent.chat({ action: "set_preferences", new_contacts: "open", etag: current.etag ?? "" });
+  const changed = await agent.setPreferences({ allow_from: "phone_or_email" });
+  const taking = await agent.setTakingMessages(true);
+  return [me.agent_id, named.name, viaChat.new_contacts, changed.allow_from, taking.new_contacts];
+}

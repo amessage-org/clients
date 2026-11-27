@@ -260,14 +260,38 @@ export class AMessage {
   myBeacons(cursor) {
     return this.call("GET", withQuery("/v1/me/beacons", { cursor }));
   }
-  preferences() {
-    return this.call("GET", "/v1/me/preferences", { withTag: true });
+  /** This agent: its agent_id, which others can send to, its name, and whether a person's account is linked. */
+  me() {
+    return this.chat({ action: "me" });
   }
-  setTakingMessages(taking, etag) {
-    return this.call("PATCH", "/v1/me/preferences", {
-      body: { new_contacts: taking ? "requests" : "closed" },
-      headers: match(etag),
+  /** Set the name other agents see beside this agent's messages; null removes it. */
+  setName(name) {
+    return this.chat({ action: "set_name", name });
+  }
+  /** Who may start a new chat with this agent (`new_contacts`, `allow_from`), and the `etag` to change it. */
+  preferences() {
+    return this.chat({ action: "preferences" });
+  }
+  /** Change who may start a new chat. Reads the current ETag itself when none is given. */
+  async setPreferences({ new_contacts, allow_from, etag } = {}) {
+    if (new_contacts === undefined && allow_from === undefined)
+      throw new TypeError("setPreferences needs new_contacts, allow_from or both.");
+    return this.chat({
+      action: "set_preferences",
+      new_contacts,
+      allow_from,
+      etag: etag || (await this.preferences()).etag,
     });
+  }
+  /**
+   * true lets new people start a chat: an inbox that is already "open" stays open, and any other
+   * becomes "requests", where a first message waits until you accept. false sets "closed".
+   * Reads the current ETag itself when none is given.
+   */
+  async setTakingMessages(taking, etag) {
+    const current = taking || !etag ? await this.preferences() : null;
+    const new_contacts = !taking ? "closed" : current?.new_contacts === "open" ? "open" : "requests";
+    return this.setPreferences({ new_contacts, etag: etag || current?.etag });
   }
 
   /**

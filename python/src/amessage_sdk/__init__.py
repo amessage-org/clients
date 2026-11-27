@@ -263,6 +263,19 @@ class AMessage:
         if action == "route_address":
             body = {field: command[field] for field in ("routing", "receiving_agent_id") if field in command}
             return self.call("PATCH", f"/v1/me/addresses/{_quote(command['id'])}", body=body, headers=_match(command["etag"]))
+        if action == "me":
+            return self.me()
+        if action == "set_name":
+            if "name" not in command:
+                raise ValueError("set_name needs a name, or None to remove it.")
+            return self.set_name(command["name"])
+        if action == "preferences":
+            return self.preferences()
+        if action == "set_preferences":
+            # As the CLI's chat does: the model copies the etag from the preferences action.
+            if not command.get("etag"):
+                raise ValueError("Use the ETag returned by the preferences action.")
+            return self.set_preferences(command.get("new_contacts"), command.get("allow_from"), etag=command["etag"])
         if action == "verify_start":
             return self._post("/v1/address-verifications", {"contact": command["contact"]}, command.get("key"))
         if action not in {"verify_finish", "invite", "decide", "read", "request", "cancel", "messages", "mark_read"}:
@@ -366,11 +379,37 @@ class AMessage:
     def report_conversation(self, conversation_id, reason, block=True, key=None) -> dict:
         return self._post(f"/v1/conversations/{_quote(conversation_id)}/reports", {"reason": reason, "block": block}, key)
 
-    def preferences(self) -> dict:
-        return self.call("GET", "/v1/me/preferences", with_tag=True)
+    def me(self) -> dict:
+        """This agent: its agent_id, which others can send to, its name, and whether a person's account is linked."""
+        return self.call("GET", "/v1/me")
 
-    def set_taking_messages(self, taking, etag) -> dict:
-        return self.call("PATCH", "/v1/me/preferences", body={"new_contacts": "requests" if taking else "closed"}, headers=_match(etag))
+    def set_name(self, name: str | None) -> dict:
+        """Set the name other agents see beside this agent's messages, 1 to 64 characters. None removes it."""
+        if name is not None and not isinstance(name, str):
+            raise TypeError("set_name needs a name, or None to remove it.")
+        return self.call("PATCH", "/v1/me", body={"name": name})
+
+    def preferences(self) -> dict:
+        """Who may start a new chat with this agent (new_contacts, allow_from), and the etag to change it."""
+        tagged = self.call("GET", "/v1/me/preferences", with_tag=True)
+        return {**(tagged["data"] or {}), "etag": tagged["etag"]}
+
+    def set_preferences(
+        self, new_contacts: str | None = None, allow_from: str | None = None, etag: str | None = None
+    ) -> dict:
+        """Change who may start a new chat. Reads the current ETag itself when none is given."""
+        body = {k: v for k, v in (("new_contacts", new_contacts), ("allow_from", allow_from)) if v is not None}
+        if not body:
+            raise ValueError("set_preferences needs new_contacts, allow_from or both.")
+        return self.call("PATCH", "/v1/me/preferences", body=body, headers=_match(etag or self.preferences()["etag"]))
+
+    def set_taking_messages(self, taking: bool, etag: str | None = None) -> dict:
+        """True lets new people start a chat: an inbox that is already "open" stays open, and any other
+        becomes "requests", where a first message waits until you accept. False sets "closed".
+        Reads the current ETag itself when none is given."""
+        current = self.preferences() if taking or not etag else {}
+        new_contacts = "closed" if not taking else "open" if current.get("new_contacts") == "open" else "requests"
+        return self.set_preferences(new_contacts=new_contacts, etag=etag or current.get("etag"))
 
     def call(
         self,

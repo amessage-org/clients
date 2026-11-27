@@ -296,5 +296,109 @@ class InboxLifecycleTest(ClientTest):
         self.assertEqual(calls[-1][3], {"routing":"invitations_only"})
 
 
+class FakeMeApi:
+    """A stand-in for GET and PATCH /v1/me and /v1/me/preferences: keeps one agent's name and
+    inbox settings, answers with an ETag, and refuses a stale If-Match like the API does."""
+
+    def __init__(self, new_contacts="requests", allow_from="anyone"):
+        self.name = None
+        self.prefs = {"new_contacts": new_contacts, "allow_from": allow_from}
+        self.revision = 1
+        self.calls = []
+
+    def me(self):
+        return {"agent_id": "a1", "inbox_id": "a1", "name": self.name, "linked_to_account": False}
+
+    def __call__(self, method, url, headers, body):
+        path = urlparse(url).path
+        sent = json.loads(body) if body else None
+        self.calls.append((method, path, headers, sent))
+        if path == "/v1/me" and method == "GET":
+            return 200, {}, json.dumps(self.me())
+        if path == "/v1/me" and method == "PATCH":
+            self.name = sent["name"]
+            return 200, {}, json.dumps(self.me())
+        tag = f'"{self.revision}"'
+        if path == "/v1/me/preferences" and method == "GET":
+            return 200, {"ETag": tag}, json.dumps(self.prefs)
+        if path == "/v1/me/preferences" and method == "PATCH":
+            if headers.get("If-Match") != tag:
+                return 412, {}, json.dumps({"code": "stale_version", "detail": "It changed."})
+            self.prefs = {**self.prefs, **sent}
+            self.revision += 1
+            return 200, {"ETag": f'"{self.revision}"'}, json.dumps(self.prefs)
+        return 404, {}, json.dumps({"code": "not_found", "detail": "No such path."})
+
+    def sent(self):
+        return [f"{method} {path}" for method, path, _, _ in self.calls]
+
+
+class MeAndPreferencesTest(ClientTest):
+    def me_client(self, api):
+        return self.client(api, token="agt_me", save_token=False)[1]
+
+    def test_shows_its_own_agent_id_and_sets_or_removes_the_name_others_see(self):
+        api = FakeMeApi()
+        op = self.me_client(api)
+        self.assertEqual(op.me(), {"agent_id": "a1", "inbox_id": "a1", "name": None, "linked_to_account": False})
+        self.assertEqual(op.set_name("Build bot")["name"], "Build bot")
+        self.assertEqual(api.calls[-1][3], {"name": "Build bot"})
+        self.assertEqual(api.calls[-1][2]["Authorization"], "Bearer agt_me")
+        self.assertEqual(op.chat({"action": "me"})["name"], "Build bot")
+        self.assertIsNone(op.chat({"action": "set_name", "name": None})["name"])
+        self.assertEqual(api.calls[-1][3], {"name": None})
+        self.assertEqual(api.sent(), ["GET /v1/me", "PATCH /v1/me", "GET /v1/me", "PATCH /v1/me"])
+        with self.assertRaises(TypeError):
+            op.set_name(42)
+        with self.assertRaises(ValueError):
+            op.chat({"action": "set_name"})
+        self.assertEqual(len(api.calls), 4)
+
+    def test_preferences_come_with_their_etag_and_set_preferences_reads_it_when_none_is_given(self):
+        api = FakeMeApi()
+        op = self.me_client(api)
+        self.assertEqual(op.preferences(), {"new_contacts": "requests", "allow_from": "anyone", "etag": '"1"'})
+        self.assertEqual(op.set_preferences(allow_from="phone"), {"new_contacts": "requests", "allow_from": "phone"})
+        self.assertEqual(api.sent()[1:], ["GET /v1/me/preferences", "PATCH /v1/me/preferences"])
+        self.assertEqual(api.calls[-1][2]["If-Match"], '"1"')
+        self.assertEqual(api.calls[-1][3], {"allow_from": "phone"})
+        op.set_preferences(new_contacts="open", allow_from="phone_or_email", etag='"2"')
+        self.assertEqual(api.calls[-2][0], "PATCH", "a given etag is used without reading again")
+        self.assertEqual(api.calls[-1][3], {"new_contacts": "open", "allow_from": "phone_or_email"})
+        with self.assertRaises(AMessageError) as caught:
+            op.set_preferences(allow_from="email", etag='"1"')
+        self.assertEqual((caught.exception.status, caught.exception.code), (412, "stale_version"))
+        calls = len(api.calls)
+        with self.assertRaises(ValueError):
+            op.set_preferences()
+        self.assertEqual(len(api.calls), calls)
+
+    def test_chat_preferences_and_set_preferences_take_the_etag_the_model_copies(self):
+        api = FakeMeApi()
+        op = self.me_client(api)
+        current = op.chat({"action": "preferences"})
+        self.assertEqual(current, {"new_contacts": "requests", "allow_from": "anyone", "etag": '"1"'})
+        changed = op.chat({"action": "set_preferences", "new_contacts": "closed", "etag": current["etag"]})
+        self.assertEqual(changed["new_contacts"], "closed")
+        self.assertEqual(api.calls[-1][3], {"new_contacts": "closed"})
+        self.assertEqual(api.calls[-1][2]["If-Match"], '"1"')
+        with self.assertRaises(ValueError):
+            op.chat({"action": "set_preferences", "allow_from": "phone"})
+
+    def test_set_taking_messages_keeps_an_open_inbox_open_asks_first_otherwise_and_closes_it(self):
+        open_ = FakeMeApi(new_contacts="open")
+        self.assertEqual(self.me_client(open_).set_taking_messages(True)["new_contacts"], "open")
+        self.assertEqual(open_.calls[-1][3], {"new_contacts": "open"})
+        closed = FakeMeApi(new_contacts="closed")
+        self.assertEqual(self.me_client(closed).set_taking_messages(True, '"1"')["new_contacts"], "requests")
+        self.assertEqual(closed.calls[-1][2]["If-Match"], '"1"')
+        api = FakeMeApi(new_contacts="open", allow_from="phone")
+        op = self.me_client(api)
+        self.assertEqual(op.set_taking_messages(False), {"new_contacts": "closed", "allow_from": "phone"})
+        self.assertEqual(api.sent(), ["GET /v1/me/preferences", "PATCH /v1/me/preferences"])
+        op.set_taking_messages(False, '"2"')
+        self.assertEqual(api.sent()[2:], ["PATCH /v1/me/preferences"], "closing with an etag reads nothing")
+
+
 if __name__ == "__main__":
     unittest.main()

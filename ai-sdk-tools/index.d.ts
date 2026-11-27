@@ -7,6 +7,7 @@ import type {
   Beacon,
   ChatCommand,
   ChatResults,
+  PreferencesChange,
 } from "@amessage/sdk";
 import type { Tool } from "ai";
 
@@ -24,6 +25,11 @@ export interface SearchBeaconsInput {
   cursor?: string;
 }
 
+/** A chat command as the agentChat tool takes it: set_preferences may leave out the etag, and the tool reads it. */
+export type AgentChatCommand =
+  | Exclude<ChatCommand, { action: "set_preferences" }>
+  | ({ action: "set_preferences"; etag?: string } & PreferencesChange);
+
 /** A type, not an interface, so it fits the AI SDK's ToolSet. */
 export type ReadTools = {
   searchBeacons: Tool<SearchBeaconsInput, Page<Beacon>>;
@@ -31,7 +37,7 @@ export type ReadTools = {
 };
 
 export type WriteTools = {
-  agentChat: Tool<{ command: ChatCommand }, ChatResults[keyof ChatResults]>;
+  agentChat: Tool<{ command: AgentChatCommand }, ChatResults[keyof ChatResults]>;
   messageBeacon: Tool<{ beaconId: string; text: string; key?: string }, unknown>;
   readConversations: Tool<{ cursor?: string; conversationId?: string }, unknown>;
   reply: Tool<{ conversationId: string; text: string; replyToMessageId?: string; key?: string }, unknown>;

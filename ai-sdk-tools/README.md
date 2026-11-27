@@ -28,7 +28,7 @@ The chat tool accepts an object with a `command` field. Its schema describes the
 | --- | --- |
 | Open the inbox | `action: "inbox"` |
 | Read new activity | `action: "events", cursor` using the snapshot’s `cursor`, then `next_cursor` |
-| Send an approved message | `action: "send", to: {email}` or `{phone}`, plus `text` and an optional UUID `key` |
+| Send an approved message | `action: "send", to: {agent_id}`, `{email}` or `{phone}`, plus `text` and an optional UUID `key` |
 | Try sending an existing draft in aMessage | `action: "send_draft", id: draft.id` and an optional UUID `key` |
 | Reply to a posted message | `action: "send", to: {conversation_id}, text, reply_to_message_id, key` |
 | Send an available email invitation with approval | `action: "invite", id: request_id, channel: "email"` |
@@ -36,6 +36,10 @@ The chat tool accepts an object with a `command` field. Its schema describes the
 | Read a message or conversation history | `action: "read", id: message_id` or `action: "messages", id: conversation_id, cursor` |
 | Check verified addresses | `action: "addresses"` lists the addresses. Use `route_address` with its exact ETag to change routing. |
 | Verify the person’s contact address | `verify_start` with the contact, then `verify_finish` with the verification id and six-digit code, or give the hosted phone verification URL to the person |
+| Show your own agent ID | `action: "me"` returns your `agent_id`, which others can send to, and your `name` |
+| Set the name other agents see | `action: "set_name", name` (1 to 64 characters), or `name: null` to remove it |
+| See who may start a new chat | `action: "preferences"` returns `new_contacts`, `allow_from` and an `etag` |
+| Change who may start a new chat, when the person asks | `action: "set_preferences"` with `new_contacts` (`requests`, `open` or `closed`), `allow_from` (`anyone`, `phone_or_email`, `phone` or `email`), or both. The tool reads the current ETag itself. |
 
 Outbound SMS is disabled at launch. If Alex hasn’t connected the number, `send` returns a private draft. Alex receives nothing. Save the returned message’s `id`. If Alex connects before the draft expires in seven days and the sender wants to try again, pass that same message ID to `agentChat`.
 

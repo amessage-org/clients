@@ -145,6 +145,99 @@ def test_send_draft_rejects_missing_id_and_extraneous_fields_before_dispatch():
     assert client.calls == []
 
 
+IDENT = "132d7d23-7a6a-45ad-a684-d18905e79671"
+
+
+def test_agent_chat_says_how_to_learn_your_own_agent_id_and_set_your_name():
+    description = AgentChat(client=FakeClient()).description
+    assert "me to learn your own agent_id" in description
+    assert "set_name to set the name other agents see" in description
+    assert "set_preferences only when the person asks" in description
+
+
+def test_agent_chat_passes_me_set_name_and_preferences_and_sends_to_an_agent_id():
+    client = FakeClient()
+    tool = AgentChat(client=client)
+    cases = [
+        ({"action": "me"}, ("chat", ({"action": "me"},), {})),
+        ({"action": "set_name", "name": "Trip planner"}, ("chat", ({"action": "set_name", "name": "Trip planner"},), {})),
+        ({"action": "set_name", "name": None}, ("chat", ({"action": "set_name", "name": None},), {})),
+        ({"action": "preferences"}, ("chat", ({"action": "preferences"},), {})),
+        (
+            {"action": "set_preferences", "allow_from": "phone"},
+            ("set_preferences", (), {"new_contacts": None, "allow_from": "phone", "etag": None}),
+        ),
+        (
+            {"action": "set_preferences", "new_contacts": "open", "etag": '"3"'},
+            ("set_preferences", (), {"new_contacts": "open", "allow_from": None, "etag": '"3"'}),
+        ),
+        (
+            {"action": "send", "to": {"agent_id": IDENT}, "text": "Hi"},
+            ("chat", ({"action": "send", "to": {"agent_id": IDENT}, "text": "Hi"},), {}),
+        ),
+    ]
+    for command, expected in cases:
+        assert json.loads(tool.invoke({"command": command})) == {"ok": True}
+        assert client.calls[-1] == expected, command
+    for bad in (
+        {"action": "me", "agent_id": IDENT},
+        {"action": "set_name"},
+        {"action": "set_name", "name": ""},
+        {"action": "set_name", "name": "x" * 65},
+        {"action": "preferences", "etag": '"3"'},
+        {"action": "set_preferences"},
+        {"action": "set_preferences", "etag": '"3"'},
+        {"action": "set_preferences", "new_contacts": "everyone"},
+        {"action": "set_preferences", "allow_from": "phone", "etag": ""},
+        {"action": "send", "to": {"agent_id": "malformed"}, "text": "Hi"},
+    ):
+        with pytest.raises(ValidationError):
+            tool.invoke({"command": bad})
+    assert len(client.calls) == len(cases)
+
+
+def test_agent_chat_changes_who_may_start_a_chat_without_an_etag_from_the_model():
+    calls = []
+    prefs = {"new_contacts": "requests", "allow_from": "anyone"}
+    me = {"agent_id": IDENT, "inbox_id": IDENT, "name": None, "linked_to_account": False}
+
+    def send(method, url, headers, body):
+        path = url.removeprefix("https://example.invalid")
+        sent = json.loads(body) if body else None
+        calls.append((method, path, headers.get("If-Match"), sent))
+        if path == "/v1/me":
+            if method == "PATCH":
+                me["name"] = sent["name"]
+            return 200, {}, json.dumps(me)
+        if method == "GET":
+            return 200, {"ETag": '"5"'}, json.dumps(prefs)
+        if headers.get("If-Match") != '"5"':
+            return 412, {}, json.dumps({"code": "stale_version", "detail": "It changed."})
+        prefs.update(sent)
+        return 200, {"ETag": '"6"'}, json.dumps(prefs)
+
+    tool = AgentChat(client=AMessage(api_url="https://example.invalid", token="test", send=send))
+    run = lambda command: json.loads(tool.invoke({"command": command}))
+    assert run({"action": "me"})["agent_id"] == IDENT
+    assert run({"action": "set_name", "name": "Trip planner"})["name"] == "Trip planner"
+    assert run({"action": "set_name", "name": None})["name"] is None
+    assert calls[-1][3] == {"name": None}
+    assert run({"action": "preferences"}) == {"new_contacts": "requests", "allow_from": "anyone", "etag": '"5"'}
+    assert run({"action": "set_preferences", "allow_from": "phone"}) == {"new_contacts": "requests", "allow_from": "phone"}
+    assert calls[-2:] == [
+        ("GET", "/v1/me/preferences", None, None),
+        ("PATCH", "/v1/me/preferences", '"5"', {"allow_from": "phone"}),
+    ]
+
+
+def test_agent_chat_schema_converts_for_tool_calling():
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+
+    schema = json.dumps(convert_to_openai_tool(AgentChat(client=FakeClient())))
+    for action in ("me", "set_name", "preferences", "set_preferences"):
+        assert f'"{action}"' in schema
+
+
 class TestSearchBeaconsStandard(ToolsUnitTests):
     """LangChain's own checks for a tool."""
 

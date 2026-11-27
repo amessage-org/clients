@@ -29,6 +29,7 @@ function fakeClient() {
     update: record("update"),
     delete: record("delete"),
     myBeacons: record("myBeacons"),
+    setPreferences: record("setPreferences"),
   };
 }
 
@@ -163,6 +164,14 @@ test("the write tools share one client and call the matching method", async () =
     ],
     ["deleteBeacon", { beaconId: ID, etag: '"abc"' }, ["delete", ID, '"abc"']],
     ["myBeacons", { cursor: "page" }, ["myBeacons", "page"]],
+    ["agentChat", { command: { action: "me" } }, ["chat", { action: "me" }]],
+    ["agentChat", { command: { action: "set_name", name: null } }, ["chat", { action: "set_name", name: null }]],
+    ["agentChat", { command: { action: "preferences" } }, ["chat", { action: "preferences" }]],
+    [
+      "agentChat",
+      { command: { action: "set_preferences", allow_from: "phone" } },
+      ["setPreferences", { allow_from: "phone" }],
+    ],
   ];
   for (const [name, input, expected] of cases) {
     await t[name].execute(t[name].inputSchema.parse(input), context);
@@ -181,4 +190,95 @@ test("the write tools share one client and call the matching method", async () =
     t.createBeacon.inputSchema.safeParse({ text: "Free", location: { lat: 91, lng: 0 } }).success,
     false,
   );
+});
+
+test("agentChat says how to learn your own agent ID and set your name", () => {
+  const { description } = amessageTools({ write: true, client: fakeClient() }).agentChat;
+  assert.match(description, /me to learn your own agent_id/);
+  assert.match(description, /set_name to set the name other agents see/);
+  assert.match(description, /set_preferences only when the person asks/);
+});
+
+test("agentChat takes me, set_name, preferences and set_preferences, with the etag optional", async () => {
+  const { inputSchema } = amessageTools({ write: true, client: fakeClient() }).agentChat;
+  const ok = (command) => inputSchema.safeParse({ command }).success;
+  for (const good of [
+    { action: "me" },
+    { action: "set_name", name: "Sam's travel agent" },
+    { action: "set_name", name: null },
+    { action: "preferences" },
+    { action: "set_preferences", new_contacts: "open" },
+    { action: "set_preferences", allow_from: "phone_or_email" },
+    { action: "set_preferences", new_contacts: "closed", allow_from: "email", etag: '"3"' },
+  ])
+    assert.equal(ok(good), true, JSON.stringify(good));
+  for (const bad of [
+    { action: "me", agent_id: ID },
+    { action: "set_name" },
+    { action: "set_name", name: "" },
+    { action: "set_name", name: "x".repeat(65) },
+    { action: "preferences", etag: '"3"' },
+    { action: "set_preferences" },
+    { action: "set_preferences", etag: '"3"' },
+    { action: "set_preferences", new_contacts: "everyone" },
+    { action: "set_preferences", allow_from: "verified" },
+    { action: "set_preferences", allow_from: "phone", etag: "" },
+  ])
+    assert.equal(ok(bad), false, JSON.stringify(bad));
+  const json = await asSchema(inputSchema).jsonSchema;
+  const branches = json.properties.command.anyOf.filter((b) => b.properties.action.const === "set_preferences");
+  assert.deepEqual(
+    branches.map((b) => b.required),
+    [
+      ["action", "new_contacts"],
+      ["action", "allow_from"],
+    ],
+  );
+  assert.ok(branches.every((b) => b.additionalProperties === false && b.description));
+  const me = json.properties.command.anyOf.find((b) => b.properties.action.const === "me");
+  assert.match(me.description, /agent_id/);
+});
+
+test("agentChat shows this agent, names it, and changes who may start a chat without an etag from the model", async () => {
+  const calls = [];
+  let prefs = { new_contacts: "requests", allow_from: "anyone" };
+  let name = null;
+  const client = new AMessage({
+    token: "agt_test",
+    saveToken: false,
+    fetch: async (url, init) => {
+      const path = new URL(url).pathname;
+      const body = init.body ? JSON.parse(init.body) : undefined;
+      calls.push({ method: init.method, path, ifMatch: init.headers["If-Match"], body });
+      const me = () => ({ agent_id: ID, inbox_id: ID, name, linked_to_account: false });
+      if (path === "/v1/me" && init.method === "GET") return Response.json(me());
+      if (path === "/v1/me" && init.method === "PATCH") {
+        name = body.name;
+        return Response.json(me());
+      }
+      if (path === "/v1/me/preferences" && init.method === "GET")
+        return Response.json(prefs, { headers: { etag: '"5"' } });
+      if (path === "/v1/me/preferences" && init.method === "PATCH") {
+        if (init.headers["If-Match"] !== '"5"') return Response.json({ code: "stale_version" }, { status: 412 });
+        prefs = { ...prefs, ...body };
+        return Response.json(prefs, { headers: { etag: '"6"' } });
+      }
+      return Response.json({ code: "not_found" }, { status: 404 });
+    },
+  });
+  const chat = amessageTools({ client, write: true }).agentChat;
+  const run = (command) => chat.execute(chat.inputSchema.parse({ command }), context);
+  assert.equal((await run({ action: "me" })).agent_id, ID);
+  assert.equal((await run({ action: "set_name", name: "Trip planner" })).name, "Trip planner");
+  assert.deepEqual(calls.at(-1).body, { name: "Trip planner" });
+  assert.deepEqual(await run({ action: "preferences" }), { ...prefs, etag: '"5"' });
+  const changed = await run({ action: "set_preferences", allow_from: "phone" });
+  assert.deepEqual(changed, { new_contacts: "requests", allow_from: "phone" });
+  assert.deepEqual(
+    calls.slice(-2).map((c) => `${c.method} ${c.path} ${c.ifMatch ?? ""}`.trim()),
+    ["GET /v1/me/preferences", 'PATCH /v1/me/preferences "5"'],
+  );
+  assert.deepEqual(calls.at(-1).body, { allow_from: "phone" });
+  await run({ action: "set_preferences", new_contacts: "open", etag: '"5"' });
+  assert.equal(calls.at(-2).method, "PATCH", "a given etag is used without reading again");
 });

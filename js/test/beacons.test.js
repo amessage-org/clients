@@ -352,3 +352,103 @@ describe("private contact introductions", () => {
     assert.deepEqual(calls.at(-1).body, { routing: "invitations_only" });
   });
 });
+
+/**
+ * A stand-in for GET and PATCH /v1/me and /v1/me/preferences: keeps one agent's name and
+ * inbox settings, answers with an ETag, and refuses a stale If-Match like the API does.
+ */
+function meApi({ new_contacts = "requests", allow_from = "anyone" } = {}) {
+  const calls = [];
+  const state = { name: null, prefs: { new_contacts, allow_from }, revision: 1 };
+  const me = () => ({ agent_id: "a1", inbox_id: "a1", name: state.name, linked_to_account: false });
+  const fetch = async (url, init = {}) => {
+    const path = new URL(url).pathname;
+    const method = init.method ?? "GET";
+    const body = init.body ? JSON.parse(init.body) : undefined;
+    calls.push({ method, path, headers: init.headers ?? {}, body });
+    if (path === "/v1/me" && method === "GET") return Response.json(me());
+    if (path === "/v1/me" && method === "PATCH") {
+      state.name = body.name;
+      return Response.json(me());
+    }
+    const tag = { etag: `"${state.revision}"` };
+    if (path === "/v1/me/preferences" && method === "GET") return Response.json(state.prefs, { headers: tag });
+    if (path === "/v1/me/preferences" && method === "PATCH") {
+      if (init.headers["If-Match"] !== tag.etag)
+        return Response.json({ code: "stale_version", detail: "It changed." }, { status: 412 });
+      state.prefs = { ...state.prefs, ...body };
+      state.revision += 1;
+      return Response.json(state.prefs, { headers: { etag: `"${state.revision}"` } });
+    }
+    return Response.json({ code: "not_found", detail: "No such path." }, { status: 404 });
+  };
+  return { fetch, calls, state };
+}
+
+const meClient = (api) => new AMessage({ fetch: api.fetch, token: "agt_me", saveToken: false });
+const sent = (api) => api.calls.map((c) => `${c.method} ${c.path}`);
+
+describe("this agent and its inbox settings", () => {
+  it("shows its own agent ID and sets or removes the name others see", async () => {
+    const api = meApi();
+    const op = meClient(api);
+    assert.deepEqual(await op.me(), { agent_id: "a1", inbox_id: "a1", name: null, linked_to_account: false });
+    assert.equal((await op.setName("Build bot")).name, "Build bot");
+    assert.deepEqual(api.calls.at(-1).body, { name: "Build bot" });
+    assert.equal(api.calls.at(-1).headers.Authorization, "Bearer agt_me");
+    assert.equal((await op.chat({ action: "me" })).name, "Build bot");
+    assert.equal((await op.chat({ action: "set_name", name: null })).name, null);
+    assert.deepEqual(api.calls.at(-1).body, { name: null });
+    assert.deepEqual(sent(api), ["GET /v1/me", "PATCH /v1/me", "GET /v1/me", "PATCH /v1/me"]);
+    assert.throws(() => op.setName(undefined), /set_name needs a name/);
+    assert.throws(() => op.chat({ action: "set_name" }), TypeError);
+    assert.equal(api.calls.length, 4);
+  });
+
+  it("reads the preferences with their etag, and setPreferences reads the etag itself when none is given", async () => {
+    const api = meApi();
+    const op = meClient(api);
+    assert.deepEqual(await op.preferences(), { new_contacts: "requests", allow_from: "anyone", etag: '"1"' });
+    assert.deepEqual(await op.setPreferences({ allow_from: "phone" }), {
+      new_contacts: "requests",
+      allow_from: "phone",
+    });
+    assert.deepEqual(sent(api).slice(1), ["GET /v1/me/preferences", "PATCH /v1/me/preferences"]);
+    assert.equal(api.calls.at(-1).headers["If-Match"], '"1"');
+    assert.deepEqual(api.calls.at(-1).body, { allow_from: "phone" });
+    await op.setPreferences({ new_contacts: "open", allow_from: "phone_or_email", etag: '"2"' });
+    assert.equal(api.calls.at(-2).method, "PATCH", "a given etag is used without reading again");
+    assert.deepEqual(api.calls.at(-1).body, { new_contacts: "open", allow_from: "phone_or_email" });
+    await assert.rejects(op.setPreferences({ allow_from: "email", etag: '"1"' }), { status: 412, code: "stale_version" });
+    const calls = api.calls.length;
+    await assert.rejects(op.setPreferences({}), /new_contacts, allow_from or both/);
+    assert.equal(api.calls.length, calls);
+  });
+
+  it("chats preferences and set_preferences as the CLI does, with the etag the model copies", async () => {
+    const api = meApi();
+    const op = meClient(api);
+    const current = await op.chat({ action: "preferences" });
+    assert.deepEqual(current, { new_contacts: "requests", allow_from: "anyone", etag: '"1"' });
+    const changed = await op.chat({ action: "set_preferences", new_contacts: "closed", etag: current.etag });
+    assert.equal(changed.new_contacts, "closed");
+    assert.deepEqual(api.calls.at(-1).body, { new_contacts: "closed" });
+    assert.equal(api.calls.at(-1).headers["If-Match"], '"1"');
+    assert.throws(() => op.chat({ action: "set_preferences", allow_from: "phone" }), /ETag returned by the preferences/);
+  });
+
+  it("setTakingMessages keeps an open inbox open, asks first otherwise, and closes it", async () => {
+    const open = meApi({ new_contacts: "open" });
+    assert.equal((await meClient(open).setTakingMessages(true)).new_contacts, "open");
+    assert.deepEqual(open.calls.at(-1).body, { new_contacts: "open" });
+    const closed = meApi({ new_contacts: "closed" });
+    assert.equal((await meClient(closed).setTakingMessages(true, '"1"')).new_contacts, "requests");
+    assert.equal(closed.calls.at(-1).headers["If-Match"], '"1"');
+    const api = meApi({ new_contacts: "open", allow_from: "phone" });
+    const op = meClient(api);
+    assert.deepEqual(await op.setTakingMessages(false), { new_contacts: "closed", allow_from: "phone" });
+    assert.deepEqual(sent(api), ["GET /v1/me/preferences", "PATCH /v1/me/preferences"]);
+    await op.setTakingMessages(false, '"2"');
+    assert.deepEqual(sent(api).slice(2), ["PATCH /v1/me/preferences"], "closing with an etag reads nothing");
+  });
+});
