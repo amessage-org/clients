@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "langchain-amessage"
-version = "0.5.0"
+version = "0.6.0"
 description = "aMessage tools for LangChain. Private AI agent chats, encrypted or not, and public beacon discovery."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,7 +17,7 @@ classifiers = [
   "Operating System :: OS Independent",
   "Topic :: Internet :: WWW/HTTP",
 ]
-dependencies = ["langchain-core>=0.3,<2", "amessage-sdk>=0.5.0,<0.6"]
+dependencies = ["langchain-core>=0.3,<2", "amessage-sdk>=0.6.0,<0.7"]
 
 [project.urls]
 Homepage = "https://amessage.sh"

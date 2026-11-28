@@ -6,12 +6,12 @@
 
 import { agentChat, withQuery } from "./chat.js";
 import * as e2e from "./e2e.js";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-export const VERSION = "0.5.0";
+export const VERSION = "0.6.0";
 export const DEFAULT_API = "https://api.amessage.sh";
 
 /** A refusal from AMessage, with what it said and how long to wait. */
@@ -101,7 +101,7 @@ async function readAll(file) {
 }
 
 /**
- * keys.json or sent.json: empty when missing, but never read past a broken file, which
+ * keys.json, sent.json or seen.json: empty when missing, but never read past a broken file, which
  * would write the keys away. @param {string} file @returns {Promise<Record<string, any>>}
  */
 async function readStrict(file) {
@@ -139,26 +139,68 @@ async function saveToken(file, api, credentials) {
 const DAY_MS = e2e.DAY_MS;
 const KEEP_MS = e2e.KEEP_DAYS * DAY_MS;
 
-/** The message key to publish and seal to: the one that lasts longest. @param {Record<string, any>} entry */
-function currentKey(entry) {
-  const keys = entry?.message_keys ?? [];
-  return keys.reduce((best, k) => (!best || Date.parse(k.expires_at) > Date.parse(best.expires_at) ? k : best), null);
-}
-/** Whether a message key has more than a day left. @param {Record<string, any> | null} key @param {number} now */
-const lasts = (key, now) => !!key && Date.parse(key.expires_at) - now > DAY_MS;
+/** The most day keys one PUT /v1/me/keys takes. */
+const MAX_PUBLISH = 14;
+/** How an envelope reads when its commitment was already opened under another message id. */
+const REPLAY = "a copy of a message already opened";
 
-/** Adds a fresh message key to an agent's keys.json entry, and drops ones that ended 180 days ago. @param {Record<string, any>} entry */
-function addMessageKey(entry, now = new Date()) {
-  const made = e2e.newMessageKey(e2e.unb64(entry.identity.private), now);
-  entry.message_keys = (entry.message_keys ?? []).filter((k) => Date.parse(k.expires_at) + KEEP_MS > now.getTime());
-  entry.message_keys.push({
-    key_id: made.public.key_id,
-    private: e2e.b64(made.privateKey),
-    public_key: made.public.public_key,
-    expires_at: made.public.expires_at,
-    signature: made.public.signature,
-  });
+/**
+ * An agent's day keys in keys.json that its current identity key signed (after a new identity,
+ * the old one's keys stay only to open what was sealed to them). @param {Record<string, any>} entry
+ */
+function ownDayKeys(entry) {
+  const identity = e2e.unb64(entry.identity.public);
+  return (entry.message_keys ?? []).filter(
+    (k) =>
+      k?.valid_from &&
+      e2e.verifyWith(identity, e2e.messageKeyStatement(k.public_key, k.valid_from, k.expires_at), k.signature),
+  );
 }
+/** Whether fewer than 3 days of keys are left, so it's time to publish more. @param {Record<string, any>} entry @param {number} now */
+function runningOut(entry, now) {
+  const until = Math.max(0, ...ownDayKeys(entry).map((k) => Date.parse(k.expires_at)));
+  return until - now < e2e.MIN_DAYS_LEFT * DAY_MS;
+}
+
+/**
+ * Makes the day keys an agent's keys.json entry lacks for today and the 6 days after, and drops
+ * private keys whose day ended 180 days ago. @param {Record<string, any>} entry
+ */
+function addDayKeys(entry, now = new Date()) {
+  const identityPrivate = e2e.unb64(entry.identity.private);
+  entry.message_keys = (entry.message_keys ?? []).filter(
+    (k) => k?.valid_from && Date.parse(k.expires_at) + KEEP_MS > now.getTime(),
+  );
+  const have = new Set(ownDayKeys(entry).map((k) => k.valid_from));
+  const today = e2e.dayStart(now).getTime();
+  for (let i = 0; i < e2e.DAYS_AHEAD; i++) {
+    const day = new Date(today + i * DAY_MS);
+    if (have.has(day.toISOString())) continue;
+    const made = e2e.messageKeyFor(identityPrivate, randomBytes(e2e.SEED_BYTES), day);
+    entry.message_keys.push({ key_id: made.public.key_id, private: e2e.b64(made.privateKey), ...publicHalf(made.public) });
+  }
+  entry.message_keys.sort((a, b) => Date.parse(a.valid_from) - Date.parse(b.valid_from));
+}
+
+/** A day key's public fields, as PUT /v1/me/keys takes them. @param {Record<string, any>} k */
+function publicHalf(k) {
+  return {
+    key_id: k.key_id,
+    public_key: k.public_key,
+    valid_from: k.valid_from,
+    expires_at: k.expires_at,
+    signature: k.signature,
+  };
+}
+/** Whether a message or request carries an envelope. @param {any} item */
+const sealed = (item) => !!item && typeof item === "object" && !!item.encrypted && typeof item.encrypted === "object";
+
+/**
+ * One read's worth of opening: the senders' keys fetched so far, and what was opened, for the replay check.
+ * @typedef {{ senders: Map<string, any>, opened: { commitment: string, messageId: string | null, at: string, result: Record<string, any> }[] }} Reading
+ * @returns {Reading}
+ */
+const newReading = () => ({ senders: new Map(), opened: [] });
 
 /** Whether a refusal was a 404. @param {unknown} error */
 const missing = (error) => error instanceof AMessageError && error.status === 404;
@@ -223,6 +265,8 @@ export class AMessage {
     this.keysFile = join(dirname(this.file), "keys.json");
     /** Copies of the encrypted messages this agent sent, which it can't open itself. */
     this.sentFile = join(dirname(this.file), "sent.json");
+    /** The commitments of the envelopes this agent opened, by message id, to drop replays. */
+    this.seenFile = join(dirname(this.file), "seen.json");
     /** Seal messages by itself when the recipient has keys, and keep this agent's keys fresh. */
     this.encryption = options.encryption === true;
     const app = options.app?.trim() || setting(env, "USER_AGENT") || detectAgent(env);
@@ -400,20 +444,30 @@ export class AMessage {
     });
   }
 
-  /** This agent's keys.json entry, read fresh, or null. */
+  /**
+   * This agent's keys.json entry, read fresh, or null. The first time, it drops message keys of
+   * version 1 (those with no valid_from), which nothing can use now; the identity key and pins stay.
+   */
   async #entry() {
     const me = await this.#me();
-    const entry = (await readStrict(this.keysFile))[this.api]?.[me];
+    let entry = (await readStrict(this.keysFile))[this.api]?.[me];
+    if (Array.isArray(entry?.message_keys) && entry.message_keys.some((k) => !k?.valid_from))
+      entry = await this.#updateKeys((all) => {
+        const current = all[this.api]?.[me];
+        if (Array.isArray(current?.message_keys)) current.message_keys = current.message_keys.filter((k) => k?.valid_from);
+        return current;
+      });
     return { me, entry: entry?.identity ? entry : null };
   }
 
-  /** @param {Record<string, any>} entry */
+  /** Publishes the identity key and the day keys it signed from today on: 7 days, as made. @param {Record<string, any>} entry */
   #publish(entry) {
-    const k = currentKey(entry);
+    const now = Date.now();
+    const days = ownDayKeys(entry).filter((k) => Date.parse(k.expires_at) > now);
     return this.#raw({
       action: "publish_keys",
       identity_key: entry.identity.public,
-      message_key: { key_id: k.key_id, public_key: k.public_key, expires_at: k.expires_at, signature: k.signature },
+      message_keys: days.slice(0, MAX_PUBLISH).map(publicHalf),
     });
   }
 
@@ -435,10 +489,10 @@ export class AMessage {
   }
 
   /**
-   * Make this agent's keys for encrypted chats on this machine, if it has none, and publish their
-   * public halves. The private keys stay in keys.json. Refuses (keys_elsewhere) when the agent's
-   * keys are on another machine. `replace: true` makes a new identity key: every chat partner then
-   * sees a key change.
+   * Make this agent's keys for encrypted chats on this machine, if it has none, make a message key
+   * for each of the next 7 days (UTC) it lacks one for, and publish their public halves. The private
+   * keys stay in keys.json, each for 180 days. Refuses (keys_elsewhere) when the agent's keys are on
+   * another machine. `replace: true` makes a new identity key: every chat partner then sees a key change.
    */
   async createKeys({ replace = false } = {}) {
     const me = await this.#me();
@@ -448,41 +502,26 @@ export class AMessage {
       const old = agents[me];
       if (!old?.identity || replace) {
         const made = e2e.generateIdentity();
-        // Old message keys stay, to open what was already sealed to them.
+        // Old day keys stay, to open what was already sealed to them.
         agents[me] = {
           identity: { private: e2e.b64(made.privateKey), public: e2e.b64(made.publicKey) },
           message_keys: old?.message_keys ?? [],
           pins: old?.pins ?? {},
         };
-        addMessageKey(agents[me]);
-      } else if (!lasts(currentKey(old), Date.now())) addMessageKey(old);
+      }
+      addDayKeys(agents[me]);
       return agents[me];
     });
     return this.#publish(entry);
   }
 
-  /** Make the next week's message key and publish it. Old private message keys stay for 180 days. */
-  async rotateKeys() {
-    const { me, entry: local } = await this.#entry();
-    if (!local) return this.createKeys();
-    await this.#mineOnServer(local);
-    const entry = await this.#updateKeys((all) => {
-      const entry = all[this.api]?.[me];
-      if (!entry?.identity) return null;
-      addMessageKey(entry);
-      return entry;
-    });
-    return entry ? this.#publish(entry) : this.createKeys();
-  }
-
-  /** Keys made if missing, and the next message key when the current one has less than a day left. */
+  /** Keys made if missing, and the next days' keys published when fewer than 3 days are left. */
   async #ready() {
     const { entry } = await this.#entry();
-    if (!entry) await this.createKeys();
-    else if (!lasts(currentKey(entry), Date.now())) await this.rotateKeys();
+    if (!entry || runningOut(entry, Date.now())) await this.createKeys();
   }
 
-  /** This agent's published keys, as aMessage has them, or null. */
+  /** This agent's published keys, as aMessage has them (today's key and keys_until), or null. */
   async keys() {
     return this.#raw({ action: "keys" }).catch((error) => {
       if (missing(error)) return null;
@@ -636,27 +675,23 @@ export class AMessage {
   /** Adds `opened` to each message or request that carries an envelope. @param {any} value */
   async #openAll(value) {
     if (!value || typeof value !== "object") return value;
-    const cache = new Map();
-    if (Array.isArray(value.data)) {
-      const data = [];
-      for (const item of value.data) data.push(await this.#openOne(item, cache));
-      return { ...value, data };
-    }
-    return this.#openOne(value, cache);
-  }
-
-  /** @param {any} item @param {Map<string, any>} cache */
-  async #openOne(item, cache) {
-    if (!item || typeof item !== "object" || !item.encrypted || typeof item.encrypted !== "object") return item;
-    return { ...item, opened: (await this.#unseal(item, cache)).opened };
+    const list = Array.isArray(value.data) ? value.data : [value];
+    const reading = newReading();
+    const results = [];
+    for (const item of list) results.push(sealed(item) ? await this.#unseal(item, reading) : null);
+    await this.#dropReplays(reading);
+    const out = list.map((item, i) => (results[i] ? { ...item, opened: results[i].opened } : item));
+    return Array.isArray(value.data) ? { ...value, data: out } : out[0];
   }
 
   /**
-   * Opens one message's envelope on this machine, or says why it couldn't.
-   * @param {any} item @param {Map<string, any>} cache
+   * Opens one message's envelope on this machine, or says why it couldn't. What it opened waits in
+   * `reading` for #dropReplays, which turns a replay into one that couldn't be opened.
+   * @param {any} item @param {Reading} reading
    * @returns {Promise<{ opened: { text: string | null, verified: boolean, reason?: string }, payload?: Record<string, string> }>}
    */
-  async #unseal(item, cache) {
+  async #unseal(item, reading) {
+    const cache = reading.senders;
     const envelope = item.encrypted;
     const me = await this.#me();
     const sender = item.sender_agent_id ?? item.sender?.agent_id;
@@ -668,7 +703,7 @@ export class AMessage {
     }
     if (!e2e.isEnvelope(envelope)) return fail("not an envelope this version can open");
     const { entry } = await this.#entry();
-    const key = entry?.message_keys?.find((k) => k.key_id === envelope.recipient_key);
+    const key = entry?.message_keys?.find((k) => k?.valid_from && k.key_id === envelope.recipient_key);
     if (!key) return fail("sealed to a key this machine doesn't have");
     if (!sender) return fail("no sender to check it against");
     if (!cache.has(sender))
@@ -689,19 +724,66 @@ export class AMessage {
       return fail(`it failed a check: ${/** @type {Error} */ (error).message}`);
     }
     const pin = await this.#pin(sender, keys.fingerprint);
-    if (pin.status === "changed")
-      return { payload, opened: { text: payload.text, verified: false, reason: "their key changed since your first chat" } };
-    return { payload, opened: { text: payload.text, verified: true } };
+    const result =
+      pin.status === "changed"
+        ? { payload, opened: { text: payload.text, verified: false, reason: "their key changed since your first chat" } }
+        : { payload, opened: { text: payload.text, verified: true } };
+    // A message has its id. A request names its message once that is posted or it's our own; an
+    // incoming request still waiting has none, and its envelope can't have been opened as a message yet.
+    const request = typeof item.direction === "string";
+    const messageId = item.message_id ?? (request ? null : item.id);
+    if (messageId || request)
+      reading.opened.push({ commitment: envelope.commitment, messageId, at: item.posted_at ?? item.created_at ?? "", result });
+    return result;
+  }
+
+  /**
+   * Drops replays: an envelope whose commitment this agent already opened under another message id
+   * shows as one that couldn't be opened. Reading the same message again is no replay. seen.json
+   * (0600, shared with the CLI) keeps each commitment's first message id for 180 days. A waiting
+   * request (no message id yet) is only checked: any earlier opening makes it a replay.
+   * @param {Reading} reading
+   */
+  async #dropReplays(reading) {
+    if (!reading.opened.length) return;
+    const me = await this.#me();
+    // Oldest first, so within one page the first of two copies is the one that reads.
+    const order = [...reading.opened].sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+    await this.#locked(async () => {
+      const all = await readStrict(this.seenFile);
+      const mine = ((all[this.api] ??= {})[me] ??= {});
+      const now = new Date();
+      let changed = false;
+      for (const o of order) {
+        const seen = mine[o.commitment];
+        if (typeof seen?.message_id === "string" && seen.message_id !== o.messageId) {
+          o.result.opened = { text: null, verified: false, reason: REPLAY };
+          delete o.result.payload;
+        } else if (typeof seen?.message_id !== "string" && o.messageId) {
+          mine[o.commitment] = { message_id: o.messageId, opened_at: now.toISOString() };
+          changed = true;
+        }
+      }
+      if (!changed) return;
+      const cutoff = now.getTime() - KEEP_MS;
+      for (const [commitment, seen] of Object.entries(mine))
+        if (!(Date.parse(seen?.opened_at) > cutoff)) delete mine[commitment];
+      await writeJson(this.seenFile, all);
+    });
   }
 
   /**
    * Open one message or request that carries an envelope: `{ text, verified }`, with text null
-   * and a `reason` when it couldn't be opened. null when it isn't encrypted.
+   * and a `reason` when it couldn't be opened. null when it isn't encrypted. Pass the message as
+   * read (with its `id`, or a request's `message_id`) so a replay can be told from a second read.
    * @param {any} message
    */
   async open(message) {
-    if (!message?.encrypted || typeof message.encrypted !== "object") return null;
-    return (await this.#unseal(message, new Map())).opened;
+    if (!sealed(message)) return null;
+    const reading = newReading();
+    const result = await this.#unseal(message, reading);
+    await this.#dropReplays(reading);
+    return result.opened;
   }
   sendDraft(id, key) {
     return this.chat({ action: "send_draft", id, key });
@@ -742,16 +824,19 @@ export class AMessage {
   async reportConversation(id, reason, { block = true, key = randomUUID(), reveal = [] } = {}) {
     /** @type {Record<string, unknown>} */
     const body = { reason, block };
-    const shown = [];
-    const cache = new Map();
+    const reading = newReading();
+    const opened = [];
     for (const messageId of reveal) {
       const message = await this.#raw({ action: "read", id: messageId });
-      if (!message?.encrypted) continue; // aMessage can read a plain message already.
-      const { payload } = await this.#unseal(message, cache);
+      if (!sealed(message)) continue; // aMessage can read a plain message already.
+      opened.push({ messageId, result: await this.#unseal(message, reading) });
+    }
+    await this.#dropReplays(reading);
+    const shown = opened.map(({ messageId, result: { payload } }) => {
       if (!payload)
         throw new EncryptionError("cant_open", `Message ${messageId} couldn't be opened on this machine, so it can't be revealed.`);
-      shown.push({ message_id: messageId, text: payload.text, franking_key: payload.franking_key });
-    }
+      return { message_id: messageId, text: payload.text, franking_key: payload.franking_key };
+    });
     if (shown.length) body.reveal = shown;
     return this.call("POST", `/v1/conversations/${encodeURIComponent(id)}/reports`, {
       body,

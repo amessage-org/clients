@@ -61,5 +61,7 @@ export async function encryptedChat(agent: AMessage, agentId: string): Promise<u
   await agent.reportConversation(again.conversation_id ?? "", "spam", { reveal: [again.id] });
   const tools: ToolSet = amessageTools({ write: true, encryption: true });
   const keyInput: ChatInput = { command: { action: "agent_keys", agent_id: agentId } };
-  return [mine.fingerprint, theirs?.key_changed, opened, found?.agent_id, tools, keyInput];
+  const published = await agent.keys();
+  const day: [string, string] | null = published ? [published.message_key.valid_from, published.message_key.expires_at] : null;
+  return [mine.fingerprint, theirs?.key_changed, opened, found?.agent_id, tools, keyInput, published?.keys_until, day];
 }

@@ -262,15 +262,18 @@ def test_agent_chat_passes_the_key_actions_with_no_private_key_in_them():
         with pytest.raises(ValidationError):
             tool.invoke({"command": bad})
     assert len(client.calls) == 5
-    assert "Encrypted chats" in tool.description
+    assert "Encrypted chats (new)" in tool.description
+    assert "next 7 days" in json.dumps(tool.args_schema.model_json_schema())
+    for banned in ("end-to-end", "quantum"):
+        assert banned not in tool.description.lower()
 
 
 def test_with_encryption_on_agent_chat_seals_on_this_machine_and_reading_opens_the_reply(tmp_path):
     me, bob_id, conversation = IDENT, "8f7e6d5c-4b3a-4291-8f7e-6d5c4b3a2918", "1a2b3c4d-5e6f-4a1b-8c2d-3e4f5a6b7c8d"
     bob_private, bob_public = e2e.generate_identity()
-    bob_key_private, bob_key = e2e.new_message_key(bob_private)
+    bob_key_private, bob_key = e2e.new_message_keys(bob_private)[0]
     bob_keys = {"agent_id": bob_id, "identity_key": e2e.b64(bob_public), "fingerprint": e2e.fingerprint(bob_public), "message_key": bob_key}
-    state = {"mine": None, "posted": []}
+    state = {"mine": None, "posted": [], "published": []}
 
     def send(method, url, headers, body):
         path = url.removeprefix("https://example.invalid")
@@ -278,7 +281,9 @@ def test_with_encryption_on_agent_chat_seals_on_this_machine_and_reading_opens_t
         if path == "/v1/me":
             return 200, {}, json.dumps({"agent_id": me, "inbox_id": me, "name": None, "linked_to_account": False})
         if path == "/v1/me/keys" and method == "PUT":
-            state["mine"] = {"agent_id": me, "fingerprint": e2e.fingerprint(e2e.unb64(sent["identity_key"])), **sent}
+            state["published"].append(sent)
+            fingerprint = e2e.fingerprint(e2e.unb64(sent["identity_key"]))
+            state["mine"] = {"agent_id": me, "identity_key": sent["identity_key"], "fingerprint": fingerprint, "message_key": sent["message_keys"][0]}
             return 200, {}, json.dumps(state["mine"])
         if path == f"/v1/agents/{bob_id}/keys":
             return 200, {}, json.dumps(bob_keys)
@@ -300,7 +305,11 @@ def test_with_encryption_on_agent_chat_seals_on_this_machine_and_reading_opens_t
     assert sent["opened"] == {"text": "Is Thursday free?", "verified": True}
     page = json.loads(tools["read_conversations"].invoke({"conversation_id": conversation}))
     assert page["data"][0]["opened"] == {"text": "Thursday works.", "verified": True}
+    [published] = state["published"]
+    assert len(published["message_keys"]) == 7, "a week of day keys, published once"
+    assert all(e2e.check_message_key(e2e.unb64(published["identity_key"]), k) for k in published["message_keys"])
     assert (tmp_path / "keys.json").exists()
+    assert (tmp_path / "seen.json").exists()
     assert amessage_tools(write=True, encryption=True)[0].client.encryption is True
 
 

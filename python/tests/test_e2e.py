@@ -16,92 +16,140 @@ ROOT = Path(__file__).resolve().parents[2]
 VECTORS = json.loads((ROOT / "test-vectors" / "encrypted-chats-vectors.json").read_text("utf-8"))
 API = "https://api.amessage.sh"
 
-# RFC 9180, Appendix A.1: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM, base mode.
-A1 = {
-    "info": bytes.fromhex("4f6465206f6e2061204772656369616e2055726e"),
-    "ikmE": bytes.fromhex("7268600d403fce431561aef583ee1613527cff655c1343f29812e66706df3234"),
-    "pkEm": "37fda3567bdbd628e88668c3c8d7e97d1d1253b6d4ea6d44c150f741f1bf4431",
-    "skEm": "52c4a758a802cd8b936eceea314432798d5baf2d7e9235dc084ab1b9cfa2f736",
-    "ikmR": bytes.fromhex("6db9df30aa07dd42ee5e8181afdb977e538f5e1fec8a06223f33f7013e525037"),
-    "pkRm": "3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d",
-    "skRm": "4612c550263fc8ad58375df3f557aac531d26850903e55a9f23f21d8534e8ac8",
-    "sharedSecret": "fe0e18c9f024ce43799ae393c7e8fe8fce9d218875e8227b0187c04e7d2ea1fc",
-    "key": "4531685d41d65f03dc48f6b8302c05b0",
-    "baseNonce": "56d890e5accaaf011cff4b7d",
-    "pt": bytes.fromhex("4265617574792069732074727574682c20747275746820626561757479"),
-    "aad": bytes.fromhex("436f756e742d30"),
-    "ct": "f938558b5d72f1a23810b4be2ab4f84331acc02fc97babc53a52ae8218a355a96d8770ac83d07bea87e13c512a",
-}
+HEX = bytes.fromhex
+U = e2e.unb64
+
+
+def _node_version() -> tuple:
+    node = shutil.which("node")
+    if not node:
+        return ()
+    out = subprocess.run([node, "--version"], capture_output=True, text=True).stdout.strip().lstrip("v")
+    return tuple(int(part) for part in out.split(".")[:2])
+
+
+# The JavaScript SDK needs Node 24.7 or later (built-in ML-KEM).
+HAS_NODE = _node_version() >= (24, 7)
 
 
 class BuildingBlocksTest(unittest.TestCase):
-    def test_matches_rfc_9180_a1(self):
-        sk_e, pk_e = e2e.derive_x25519(A1["ikmE"])
-        sk_r, pk_r = e2e.derive_x25519(A1["ikmR"])
-        self.assertEqual((pk_e.hex(), sk_e.hex()), (A1["pkEm"], A1["skEm"]))
-        self.assertEqual((pk_r.hex(), sk_r.hex()), (A1["pkRm"], A1["skRm"]))
-        enc, ct = e2e.hpke_seal(pk_r, A1["info"], A1["aad"], A1["pt"], (sk_e, pk_e))
-        self.assertEqual(enc.hex(), A1["pkEm"])
-        schedule = e2e.inspect(enc, sk_r, A1["info"])
-        self.assertEqual(schedule["shared"].hex(), A1["sharedSecret"])
-        self.assertEqual(schedule["key"].hex(), A1["key"])
-        self.assertEqual(schedule["nonce"].hex(), A1["baseNonce"])
-        self.assertEqual(ct.hex(), A1["ct"])
-        self.assertEqual(e2e.hpke_open(sk_r, enc, A1["info"], A1["aad"], ct), A1["pt"])
+    def test_matches_draft_ietf_hpke_pq_a5(self):
+        h = VECTORS["hpke"]
+        sk = HEX(h["skRm"])
+        self.assertEqual(e2e.message_public_of(sk).hex(), h["pkRm"])
+        schedule = e2e.inspect(sk, HEX(h["enc"]), HEX(h["info"]))
+        self.assertEqual(schedule["shared"].hex(), h["shared_secret"])
+        self.assertEqual(schedule["key"].hex(), h["key"])
+        self.assertEqual(schedule["nonce"].hex(), h["base_nonce"])
+        self.assertEqual(len(h["encryptions"]), 2)
+        for m in h["encryptions"]:
+            opened = e2e.open_at(sk, HEX(h["enc"]), HEX(h["info"]), HEX(m["aad"]), HEX(m["ct"]), HEX(m["nonce"]))
+            self.assertEqual(opened.hex(), m["pt"])
+        first = h["encryptions"][0]
+        # The first message is the one a single-shot open reads, with the base nonce.
+        self.assertEqual(e2e.hpke_open(sk, HEX(h["enc"]), HEX(h["info"]), HEX(first["aad"]), HEX(first["ct"])).hex(), first["pt"])
+        ct = HEX(first["ct"])
         with self.assertRaises(ValueError):
-            e2e.hpke_open(sk_r, enc, A1["info"], A1["aad"], bytes([ct[0] ^ 1]) + ct[1:])
+            e2e.open_at(sk, HEX(h["enc"]), HEX(h["info"]), HEX(first["aad"]), bytes([ct[0] ^ 1]) + ct[1:], HEX(first["nonce"]))
+        enc = HEX(h["enc"])
+        with self.assertRaises(ValueError):
+            e2e.hpke_open(sk, enc[:-1] + bytes([enc[-1] ^ 1]), HEX(h["info"]), HEX(first["aad"]), ct)
 
-    def test_seals_the_spec_vectors_byte_for_byte_and_opens_them(self):
-        v, u = VECTORS, e2e.unb64
+    def test_reproduces_the_vector_identities_day_key_and_signatures_and_opens_the_envelope(self):
+        v = VECTORS
         for who in (v["alice_identity"], v["bob_identity"]):
-            self.assertEqual(e2e.b64(e2e.identity_public_of(u(who["private"]))), who["public"])
-            self.assertEqual(e2e.fingerprint(u(who["public"])), who["fingerprint"])
-        bob_key = v["bob_message_key"]
-        self.assertEqual(e2e.b64(e2e.x25519_public_of(u(bob_key["private"]))), bob_key["public_key"])
-        self.assertEqual(e2e.key_id(u(bob_key["public_key"])), bob_key["key_id"])
-        statement = e2e.message_key_statement(bob_key["public_key"], bob_key["expires_at"])
-        self.assertEqual(e2e.sign_with(u(v["bob_identity"]["private"]), statement), bob_key["signature"])
+            self.assertEqual(e2e.b64(e2e.identity_public_of(U(who["private"]))), who["public"])
+            self.assertEqual(e2e.fingerprint(U(who["public"])), who["fingerprint"])
+        day = v["bob_day_key"]
+        published = {k: day[k] for k in ("key_id", "public_key", "valid_from", "expires_at", "signature")}
+        self.assertEqual(e2e.b64(e2e.message_public_of(U(day["private_seed"]))), day["public_key"])
+        self.assertEqual(e2e.key_id(U(day["public_key"])), day["key_id"])
+        statement = e2e.message_key_statement(day["public_key"], day["valid_from"], day["expires_at"])
+        self.assertEqual(statement, day["statement"])
+        self.assertEqual(e2e.sign_with(U(v["bob_identity"]["private"]), statement), day["signature"])
+        # Any moment of the day gives the same day key.
+        seed, made = e2e.message_key_for(U(v["bob_identity"]["private"]), U(day["private_seed"]), e2e.parse_time("2026-12-01T18:00:00Z"))
+        self.assertEqual(json.dumps(made), json.dumps(published))
         bob = v["bob_identity"]
-        self.assertTrue(e2e.check_keys({"identity_key": bob["public"], "fingerprint": bob["fingerprint"], "message_key": bob_key}))
+        self.assertTrue(e2e.check_keys({"identity_key": bob["public"], "fingerprint": bob["fingerprint"], "message_key": published}))
+
+        envelope = v["envelope"]
+        self.assertTrue(e2e.is_envelope(envelope))
+        self.assertEqual(e2e.envelope_statement(envelope), v["envelope_statement"])
+        self.assertEqual(e2e.associated_data(envelope["sender_key"], envelope["recipient_key"]).decode(), v["associated_data"])
+        self.assertTrue(e2e.verify_with(U(v["alice_identity"]["public"]), v["envelope_statement"], envelope["sig"]))
         payload = json.loads(v["plaintext_payload"])
-        ephemeral = u(v["ephemeral_private"])
-        envelope = e2e.seal_message(
+        opened = e2e.open_message(envelope, U(day["private_seed"]), U(v["alice_identity"]["public"]), payload["to"], payload["from"])
+        self.assertEqual(json.dumps(opened, ensure_ascii=False, separators=(",", ":")), v["plaintext_payload"])
+        self.assertTrue(e2e.reveal_matches(opened["franking_key"], opened["text"], envelope["commitment"]))
+
+        # Sealing the same payload again takes fresh randomness: a new seal, the same commitment.
+        again = e2e.seal_message(
             payload["text"],
             payload["from"],
             payload["to"],
-            u(v["alice_identity"]["private"]),
-            u(v["alice_identity"]["public"]),
-            bob_key,
+            U(v["alice_identity"]["private"]),
+            U(v["alice_identity"]["public"]),
+            published,
             now=e2e.parse_time(v["sent_at"]),
-            ephemeral=(ephemeral, e2e.x25519_public_of(ephemeral)),
-            franking_key=u(v["franking_key"]),
+            franking_key=U(v["franking_key"]),
         )
-        self.assertEqual(json.dumps(envelope, separators=(",", ":")), json.dumps(v["envelope"], separators=(",", ":")))
-        self.assertTrue(e2e.is_envelope(envelope))
-        opened = e2e.open_message(v["envelope"], u(bob_key["private"]), u(v["alice_identity"]["public"]), payload["to"], payload["from"])
-        self.assertEqual(json.dumps(opened, ensure_ascii=False, separators=(",", ":")), v["plaintext_payload"])
-        self.assertTrue(e2e.reveal_matches(opened["franking_key"], opened["text"], v["envelope"]["commitment"]))
+        self.assertEqual(list(again), list(envelope))
+        self.assertEqual(again["commitment"], envelope["commitment"])
+        self.assertNotEqual(again["enc"], envelope["enc"])
+        reopened = e2e.open_message(again, U(day["private_seed"]), U(v["alice_identity"]["public"]), payload["to"], payload["from"])
+        self.assertEqual(json.dumps(reopened, ensure_ascii=False, separators=(",", ":")), v["plaintext_payload"])
+
+    def test_makes_a_key_for_each_utc_day_signed_with_both_of_its_dates(self):
+        bob_private, bob_public = e2e.generate_identity()
+        keys = e2e.new_message_keys(bob_private, e2e.parse_time("2026-12-03T10:00:00Z"))
+        self.assertEqual(len(keys), e2e.DAYS_AHEAD)
+        self.assertEqual(
+            [(k["valid_from"], k["expires_at"]) for _, k in keys],
+            [(f"2026-12-{3 + i:02d}T00:00:00.000Z", f"2026-12-{4 + i:02d}T00:00:00.000Z") for i in range(7)],
+        )
+        for seed, k in keys:
+            self.assertEqual(len(seed), e2e.SEED_BYTES)
+            self.assertEqual(len(U(k["public_key"])), e2e.PUBLIC_BYTES)
+            self.assertTrue(e2e.check_message_key(bob_public, k))
+        self.assertEqual(len({k["key_id"] for _, k in keys}), 7)
+        self.assertEqual(e2e.iso(e2e.day_start(e2e.parse_time("2026-12-03T23:59:59.999Z"))), "2026-12-03T00:00:00.000Z")
+        today = keys[0][1]
+        self.assertFalse(e2e.check_message_key(bob_public, {**today, "valid_from": "2026-12-03T12:00:00.000Z"}), "not a whole day")
+        self.assertFalse(e2e.check_message_key(bob_public, {**today, "expires_at": keys[1][1]["expires_at"]}))
+        self.assertFalse(e2e.check_message_key(e2e.generate_identity()[1], today), "someone else's signature")
+        self.assertFalse(e2e.check_message_key(bob_public, {**today, "key_id": "0" * 32}))
 
     def test_opens_for_its_recipient_only_and_refuses_every_kind_of_tampering(self):
         alice_private, alice_public = e2e.generate_identity()
         bob_private, bob_public = e2e.generate_identity()
-        bob_key_private, bob_key = e2e.new_message_key(bob_private)
+        (bob_key_private, bob_key), (tomorrow_private, _) = e2e.new_message_keys(bob_private)[:2]
         text = "Can you check the build log? Ünïcödé ✓"
         envelope = e2e.seal_message(text, "alice-id", "bob-id", alice_private, alice_public, bob_key)
+        self.assertTrue(e2e.is_envelope(envelope))
+        self.assertEqual(len(U(envelope["enc"])), e2e.ENC_BYTES)
 
-        def read(e=envelope, me="bob-id", sender="alice-id", key=alice_public):
-            return e2e.open_message(e, bob_key_private, key, me, sender)
+        def read(e=envelope, me="bob-id", sender="alice-id", key=alice_public, private=bob_key_private):
+            return e2e.open_message(e, private, key, me, sender)
 
         payload = read()
         self.assertEqual(payload["text"], text)
         self.assertFalse(e2e.reveal_matches(payload["franking_key"], "Something else", envelope["commitment"]))
 
         def flip(s):
-            raw = e2e.unb64(s)
+            raw = U(s)
             return e2e.b64(bytes([raw[0] ^ 1]) + raw[1:])
 
-        with self.assertRaises(ValueError):
+        def resign(e):
+            unsigned = {k: e[k] for k in ("suite", "sender_key", "recipient_key", "enc", "ct", "commitment")}
+            return {**e, "sig": e2e.sign_with(alice_private, e2e.envelope_statement(unsigned))}
+
+        with self.assertRaisesRegex(ValueError, "signature"):
             read({**envelope, "ct": flip(envelope["ct"])})
+        with self.assertRaises(ValueError):
+            read(resign({**envelope, "ct": flip(envelope["ct"])}))
+        with self.assertRaises(ValueError):
+            read(resign({**envelope, "enc": flip(envelope["enc"])}))
         with self.assertRaisesRegex(ValueError, "signature"):
             read({**envelope, "commitment": flip(envelope["commitment"])})
         with self.assertRaisesRegex(ValueError, "other agents"):
@@ -110,16 +158,22 @@ class BuildingBlocksTest(unittest.TestCase):
             read(sender="mallory-id")
         with self.assertRaisesRegex(ValueError, "sender's key"):
             read(key=bob_public)
+        with self.assertRaises(ValueError, msg="another day's key can't open it"):
+            read(private=tomorrow_private)
         _, mallory = e2e.generate_identity()
         resigned = {**envelope, "sender_key": e2e.fingerprint(mallory), "sig": e2e.b64(bytes(64))}
         with self.assertRaisesRegex(ValueError, "signature"):
             read(resigned, key=mallory)
         self.assertFalse(e2e.is_envelope({**envelope, "extra": 1}))
-        self.assertFalse(e2e.is_envelope({**envelope, "v": 2}))
+        self.assertFalse(e2e.is_envelope({**envelope, "v": 1}))
         self.assertFalse(e2e.is_envelope({**envelope, "v": True}))
+        self.assertFalse(e2e.is_envelope({**envelope, "suite": "x25519-hkdf-sha256-aes128gcm"}))
+        self.assertFalse(e2e.is_envelope({**envelope, "enc": e2e.b64(bytes(32))}))
+        self.assertFalse(e2e.is_envelope({**envelope, "sig": e2e.b64(bytes(32))}))
         seal = lambda t: e2e.seal_message(t, "a", "b", alice_private, alice_public, bob_key)
         # 2,000 characters fit in any script; 2,001 don't.
         self.assertLessEqual(len(json.dumps(seal("😀" * 2000), separators=(",", ":"))), e2e.MAX_ENVELOPE_BYTES)
+        self.assertLessEqual(len(json.dumps(seal("界" * 2000), separators=(",", ":"))), e2e.MAX_ENVELOPE_BYTES)
         with self.assertRaises(ValueError):
             seal("a" * 2001)
 
@@ -128,7 +182,7 @@ class BuildingBlocksTest(unittest.TestCase):
         sealed = e2e.export_keys(entry, "correct horse battery staple")
         self.assertEqual(list(sealed), ["v", "kdf", "n", "r", "p", "salt", "nonce", "ct"])
         self.assertEqual([sealed[k] for k in ("v", "kdf", "n", "r", "p")], [1, "scrypt", 32768, 8, 1])
-        self.assertEqual((len(e2e.unb64(sealed["salt"])), len(e2e.unb64(sealed["nonce"]))), (16, 12))
+        self.assertEqual((len(U(sealed["salt"])), len(U(sealed["nonce"]))), (16, 12))
         self.assertEqual(e2e.import_keys(sealed, "correct horse battery staple"), entry)
         with self.assertRaisesRegex(ValueError, "Wrong passphrase"):
             e2e.import_keys(sealed, "wrong")
@@ -138,7 +192,7 @@ NODE_SEAL = """
 import * as e from %s;
 const alice = e.generateIdentity();
 const bob = e.generateIdentity();
-const key = e.newMessageKey(bob.privateKey);
+const [key] = e.newMessageKeys(bob.privateKey);
 const text = "Sealed in JavaScript: Ünïcödé ✓ 😀";
 const envelope = e.sealMessage({ text, from: "alice-id", to: "bob-id", identityPrivate: alice.privateKey,
   identityPublic: alice.publicKey, recipientKey: key.public });
@@ -147,20 +201,57 @@ console.log(JSON.stringify({ text, alice_public: e.b64(alice.publicKey), bob_pub
   bob_key: { private: e.b64(key.privateKey), ...key.public }, envelope, entry, exported: e.exportKeys(entry, "pass phrase") }));
 """
 
+NODE_OPEN = """
+import * as e from %s;
+import { readFileSync } from "node:fs";
+const made = JSON.parse(readFileSync(0, "utf8"));
+const keys = { identity_key: made.bob_public, fingerprint: e.fingerprint(e.unb64(made.bob_public)), message_key: made.bob_key };
+const payload = e.openMessage({ envelope: made.envelope, messagePrivate: e.unb64(made.bob_private), senderIdentityPublic: e.unb64(made.alice_public),
+  me: "bob-id", sender: "alice-id" });
+console.log(JSON.stringify({ checks: e.checkKeys(keys), envelope: e.isEnvelope(made.envelope), payload,
+  commitment: e.revealMatches(payload.franking_key, payload.text, made.envelope.commitment), imported: e.importKeys(made.exported, "pass phrase") }));
+"""
 
-@unittest.skipUnless(shutil.which("node"), "needs node to seal with the JavaScript SDK")
+
+@unittest.skipUnless(HAS_NODE, "needs Node 24.7 or later to run the JavaScript SDK")
 class CrossLanguageTest(unittest.TestCase):
+    def node(self, script: str, stdin: str = "") -> dict:
+        source = script % json.dumps((ROOT / "js" / "e2e.js").as_uri())
+        done = subprocess.run(["node", "--input-type=module", "-e", source], input=stdin, check=True, capture_output=True, text=True)
+        return json.loads(done.stdout)
+
     def test_opens_an_envelope_and_an_export_the_javascript_sdk_made(self):
-        script = NODE_SEAL % json.dumps((ROOT / "js" / "e2e.js").as_uri())
-        made = json.loads(subprocess.run(["node", "--input-type=module", "-e", script], check=True, capture_output=True, text=True).stdout)
+        made = self.node(NODE_SEAL)
         bob_key = made["bob_key"]
         self.assertTrue(
-            e2e.check_keys({"identity_key": made["bob_public"], "fingerprint": e2e.fingerprint(e2e.unb64(made["bob_public"])), "message_key": bob_key})
+            e2e.check_keys({"identity_key": made["bob_public"], "fingerprint": e2e.fingerprint(U(made["bob_public"])), "message_key": bob_key})
         )
-        payload = e2e.open_message(made["envelope"], e2e.unb64(bob_key["private"]), e2e.unb64(made["alice_public"]), "bob-id", "alice-id")
+        self.assertEqual(e2e.message_public_of(U(bob_key["private"])), U(bob_key["public_key"]))
+        payload = e2e.open_message(made["envelope"], U(bob_key["private"]), U(made["alice_public"]), "bob-id", "alice-id")
         self.assertEqual(payload["text"], made["text"])
         self.assertTrue(e2e.reveal_matches(payload["franking_key"], payload["text"], made["envelope"]["commitment"]))
         self.assertEqual(e2e.import_keys(made["exported"], "pass phrase"), made["entry"])
+
+    def test_the_javascript_sdk_opens_an_envelope_and_an_export_python_made(self):
+        alice_private, alice_public = e2e.generate_identity()
+        bob_private, bob_public = e2e.generate_identity()
+        bob_seed, bob_key = e2e.new_message_keys(bob_private)[0]
+        text = "Sealed in Python: Ünïcödé ✓ 😀"
+        envelope = e2e.seal_message(text, "alice-id", "bob-id", alice_private, alice_public, bob_key)
+        entry = {"identity": {"private": e2e.b64(alice_private), "public": e2e.b64(alice_public)}, "message_keys": [], "pins": {}}
+        made = {
+            "alice_public": e2e.b64(alice_public),
+            "bob_public": e2e.b64(bob_public),
+            "bob_key": bob_key,
+            "bob_private": e2e.b64(bob_seed),
+            "envelope": envelope,
+            "exported": e2e.export_keys(entry, "pass phrase"),
+        }
+        opened = self.node(NODE_OPEN, json.dumps(made))
+        self.assertEqual((opened["checks"], opened["envelope"], opened["commitment"]), (True, True, True))
+        self.assertEqual(opened["payload"]["text"], text)
+        self.assertEqual((opened["payload"]["from"], opened["payload"]["to"]), ("alice-id", "bob-id"))
+        self.assertEqual(opened["imported"], entry)
 
 
 class FakeServer:
@@ -170,7 +261,7 @@ class FakeServer:
     def __init__(self):
         self.tokens, self.keys, self.phones = {}, {}, {}
         self.conversations, self.messages, self.reports, self.calls, self.refuse_next = {}, {}, [], [], []
-        # Agents whose weekly message key lapsed: no keys to seal to, but an identity still.
+        # Agents whose day keys ran out: no key for today to seal to, but an identity still.
         self.lapsed = set()
 
     @staticmethod
@@ -178,10 +269,19 @@ class FakeServer:
         return status, {}, json.dumps({"code": code, "detail": f"Refused: {code}."})
 
     def published(self, agent_id):
+        """Today's key, as GET /v1/agents/{id}/keys answers."""
         k = None if agent_id in self.lapsed else self.keys.get(agent_id)
         if not k:
             return None
-        return {"agent_id": agent_id, "identity_key": k["identity_key"], "fingerprint": k["fingerprint"], "message_key": k["message_keys"][-1]}
+        now = datetime.now(timezone.utc)
+        today = [m for m in k["message_keys"] if e2e.parse_time(m["valid_from"]) <= now < e2e.parse_time(m["expires_at"])]
+        if not today:
+            return None
+        key = max(today, key=lambda m: m["valid_from"])
+        return {"agent_id": agent_id, "identity_key": k["identity_key"], "fingerprint": k["fingerprint"], "message_key": key}
+
+    def keys_until(self, agent_id):
+        return max(m["expires_at"] for m in self.keys[agent_id]["message_keys"])
 
     def chat_between(self, a, b):
         for c in self.conversations.values():
@@ -209,18 +309,28 @@ class FakeServer:
             encryption = {"fingerprint": self.keys[me]["fingerprint"]} if me in self.keys else None
             return self.ok({"agent_id": me, "inbox_id": me, "name": None, "linked_to_account": False, "encryption": encryption})
         if path == "/v1/me/keys" and method == "PUT":
-            fp = e2e.fingerprint(e2e.unb64(body["identity_key"]))
-            if not e2e.check_keys({**body, "fingerprint": fp}):
-                return self.problem(422, "invalid_keys")
+            identity = e2e.unb64(body["identity_key"])
+            fp = e2e.fingerprint(identity)
+            days = body.get("message_keys")
+            if len(identity) != 32 or not isinstance(days, list) or not 1 <= len(days) <= 14:
+                return self.problem(400, "bad_request")
+            now = datetime.now(timezone.utc)
+            if not all(e2e.check_message_key(identity, m) and e2e.parse_time(m["expires_at"]) > now for m in days):
+                return self.problem(400, "bad_request")
             before = self.keys.get(me)
+            # A new identity key replaces the old one, and the old one's day keys stop taking messages.
             if not before or before["identity_key"] != body["identity_key"]:
-                self.keys[me] = {"identity_key": body["identity_key"], "fingerprint": fp, "message_keys": [body["message_key"]]}
-            elif before["message_keys"][-1]["key_id"] != body["message_key"]["key_id"]:
-                before["message_keys"].append(body["message_key"])
+                self.keys[me] = {"identity_key": body["identity_key"], "fingerprint": fp, "message_keys": []}
+            held = self.keys[me]["message_keys"]
+            for m in days:
+                if all(k["key_id"] != m["key_id"] for k in held):
+                    held.append(m)
             self.lapsed.discard(me)
-            return self.ok(self.published(me))
+            return self.ok(self.published(me)) if self.published(me) else self.problem(400, "bad_request")
         if path == "/v1/me/keys":
-            return self.ok(self.published(me)) if self.published(me) else self.problem(404, "not_found")
+            if not self.published(me):
+                return self.problem(404, "not_found")
+            return self.ok({**self.published(me), "keys_until": self.keys_until(me)})
         parts = path.strip("/").split("/")
         if len(parts) == 4 and parts[1] == "agents" and parts[3] == "keys":
             answer = self.published(parts[2])
@@ -266,7 +376,11 @@ class FakeServer:
                 if not e2e.verify_with(e2e.unb64(sender["identity_key"]), e2e.envelope_statement(env), env["sig"]):
                     return self.problem(422, "invalid_envelope")
                 now = datetime.now(timezone.utc)
-                usable = [k["key_id"] for k in recipient.get("message_keys", []) if e2e.parse_time(k["expires_at"]) + e2e.DAY > now]
+                usable = [
+                    k["key_id"]
+                    for k in recipient.get("message_keys", [])
+                    if e2e.parse_time(k["expires_at"]) + e2e.DAY > now and e2e.parse_time(k["valid_from"]) <= now + e2e.DAY
+                ]
                 if env["recipient_key"] not in usable:
                     return self.problem(409, "stale_key")
                 c["encrypted"] = True
@@ -325,10 +439,28 @@ class EncryptedChatTest(unittest.TestCase):
         entry = bob.entry()
         self.assertEqual(list(entry), ["identity", "message_keys", "pins"])
         self.assertEqual(list(entry["identity"]), ["private", "public"])
-        self.assertEqual(list(entry["message_keys"][0]), ["key_id", "private", "public_key", "expires_at", "signature"])
+        self.assertEqual(len(entry["message_keys"]), 7, "a key for each of the next 7 days")
+        self.assertEqual(list(entry["message_keys"][0]), ["key_id", "private", "public_key", "valid_from", "expires_at", "signature"])
+        today = e2e.day_start(datetime.now(timezone.utc))
+        self.assertEqual([k["valid_from"] for k in entry["message_keys"]], [e2e.iso(today + i * e2e.DAY) for i in range(7)])
+        for k in entry["message_keys"]:
+            self.assertEqual(len(e2e.unb64(k["private"])), e2e.SEED_BYTES)
+        put = server.puts()[-1][3]
+        self.assertEqual(list(put), ["identity_key", "message_keys"])
+        self.assertEqual(
+            put["message_keys"],
+            [{f: k[f] for f in ("key_id", "public_key", "valid_from", "expires_at", "signature")} for k in entry["message_keys"]],
+            "the public halves of all 7 days, in order",
+        )
         self.assertEqual(published["fingerprint"], e2e.fingerprint(e2e.unb64(entry["identity"]["public"])))
-        self.assertEqual(bob.op.keys(), published)
+        self.assertEqual(published["message_key"]["key_id"], entry["message_keys"][0]["key_id"], "today's key")
+        self.assertEqual(bob.op.keys(), {**published, "keys_until": entry["message_keys"][6]["expires_at"]})
         self.assertEqual(bob.op.create_keys()["fingerprint"], published["fingerprint"], "a second call keeps the identity")
+        self.assertEqual(
+            [k["key_id"] for k in bob.entry()["message_keys"]],
+            [k["key_id"] for k in entry["message_keys"]],
+            "and makes no new keys for days it has",
+        )
 
         sent = alice.op.send_message({"agent_id": bob.id}, "Can you check the build log?")
         self.assertIsNone(sent["text"])
@@ -366,7 +498,7 @@ class EncryptedChatTest(unittest.TestCase):
             for secret in [e["identity"]["private"], *(k["private"] for k in e["message_keys"])]:
                 self.assertNotIn(secret, wire)
 
-    def test_wont_publish_over_keys_another_machine_holds_even_when_their_message_key_lapsed(self):
+    def test_wont_publish_over_keys_another_machine_holds_even_when_their_day_keys_ran_out(self):
         server = FakeServer()
         first, bob = Agent(server, encryption=True), Agent(server, encryption=True)
         first.op.create_keys()
@@ -374,7 +506,7 @@ class EncryptedChatTest(unittest.TestCase):
         original = server.keys[first.id]["fingerprint"]
         server.lapsed.add(first.id)
         second = AMessage(send=server, env={}, home=Path(tempfile.mkdtemp()), token=f"agt_{first.id}", encryption=True)
-        self.assertIsNone(second.keys(), "GET /v1/me/keys says nothing once the message key lapsed")
+        self.assertIsNone(second.keys(), "GET /v1/me/keys says nothing without a key for today")
         before = len(server.puts())
         with self.assertRaises(EncryptionError) as caught:
             second.create_keys()
@@ -384,17 +516,16 @@ class EncryptedChatTest(unittest.TestCase):
         for attempt in (
             lambda: second.send_message({"agent_id": bob.id}, "Hi"),
             lambda: second.chat({"action": "publish_keys"}),
-            second.rotate_keys,
         ):
             with self.assertRaises(EncryptionError) as refused:
                 attempt()
             self.assertEqual(refused.exception.code, "keys_elsewhere")
         self.assertEqual(len(server.puts()), before, "nothing was published")
         self.assertEqual(server.keys[first.id]["fingerprint"], original)
-        self.assertEqual(first.op.rotate_keys()["fingerprint"], original, "the machine that holds them publishes as before")
+        self.assertEqual(first.op.create_keys()["fingerprint"], original, "the machine that holds them publishes as before")
         replaced = second.create_keys(replace=True)
         self.assertNotEqual(replaced["fingerprint"], original)
-        for attempt in (first.op.rotate_keys, first.op.create_keys):
+        for attempt in (first.op.create_keys, lambda: first.op.chat({"action": "publish_keys"})):
             with self.assertRaises(EncryptionError) as refused:
                 attempt()
             self.assertEqual(refused.exception.code, "keys_elsewhere")
@@ -453,30 +584,110 @@ class EncryptedChatTest(unittest.TestCase):
         self.assertIsNotNone(alice.op.send_message({"agent_id": bob.id}, "After")["encrypted"])
         self.assertTrue(alice.op.read_conversation(first["conversation_id"])["data"][1]["opened"]["verified"])
 
-    def test_makes_the_next_message_key_when_a_day_is_left_and_keeps_the_old_private_key(self):
+    def test_publishes_the_next_days_when_fewer_than_3_are_left_keeps_180_days_and_drops_version_1_keys(self):
         server = FakeServer()
         alice, bob = Agent(server, encryption=True), Agent(server, encryption=True)
         bob.op.create_keys()
-        early = alice.op.send_message({"agent_id": bob.id}, "Sealed to the first key")
+        early = alice.op.send_message({"agent_id": bob.id}, "Sealed to today's key")
         everything = bob.file("keys.json")
         keys = everything[API][bob.id]["message_keys"]
-        now = datetime.now(timezone.utc)
-        ancient = {**keys[0], "key_id": "0" * 32, "expires_at": e2e.iso(now - timedelta(days=181))}
-        keys[0]["expires_at"] = e2e.iso(now + timedelta(hours=1))
-        keys.insert(0, ancient)
+        today = keys[0]
+        # Three days left: nothing to publish yet.
+        everything[API][bob.id]["message_keys"] = keys[:4]
         (bob.dir / "keys.json").write_text(json.dumps(everything))
         before = len(server.puts())
         bob.op.read_conversation(early["conversation_id"])
-        self.assertEqual(len(server.puts()), before + 1, "reading rotated the key")
-        after = bob.entry()["message_keys"]
-        self.assertEqual([k["key_id"] for k in after], [keys[1]["key_id"], server.keys[bob.id]["message_keys"][-1]["key_id"]])
-        self.assertEqual(bob.mode("keys.json"), 0o600)
-        late = alice.op.send_message({"agent_id": bob.id}, "Sealed to the next key")
-        self.assertEqual(late["encrypted"]["recipient_key"], after[1]["key_id"])
+        self.assertEqual(len(server.puts()), before, "three days left is enough")
+        # Two days left, an ancient key and a key of version 1: reading publishes, and tidies.
+        now = datetime.now(timezone.utc)
+        ancient = {**today, "key_id": "0" * 32, "valid_from": e2e.iso(now - timedelta(days=182)), "expires_at": e2e.iso(now - timedelta(days=181))}
+        kept = {**today, "key_id": "1" * 32, "valid_from": e2e.iso(now - timedelta(days=171)), "expires_at": e2e.iso(now - timedelta(days=170))}
+        version1 = {"key_id": "2" * 32, "private": today["private"], "public_key": "abc", "expires_at": e2e.iso(now + e2e.DAY), "signature": "abc"}
+        everything[API][bob.id]["message_keys"] = [version1, ancient, kept, *keys[:2]]
+        everything[API][bob.id]["pins"] = {alice.id: "a" * 64}
+        (bob.dir / "keys.json").write_text(json.dumps(everything))
+        before = len(server.puts())
         page = bob.op.read_conversation(early["conversation_id"])
-        self.assertEqual([m["opened"]["text"] for m in page["data"]], ["Sealed to the next key", "Sealed to the first key"])
-        bob.op.rotate_keys()
-        self.assertEqual(len(bob.entry()["message_keys"]), 3)
+        self.assertEqual(
+            page["data"][0]["opened"],
+            {"text": "Sealed to today's key", "verified": False, "reason": "their key changed since your first chat"},
+            "pins stayed",
+        )
+        self.assertEqual(len(server.puts()), before + 1, "reading published the next days")
+        published = server.puts()[-1][3]["message_keys"]
+        self.assertEqual(len(published), 7)
+        self.assertEqual([k["key_id"] for k in published[:2]], [k["key_id"] for k in keys[:2]], "the days it had, again")
+        after = bob.entry()
+        self.assertEqual(list(after), ["identity", "message_keys", "pins"])
+        self.assertEqual(
+            [k["key_id"] for k in after["message_keys"]],
+            [kept["key_id"], *(k["key_id"] for k in published)],
+            "version 1 and 181-day-old keys are gone; one 170 days old stays",
+        )
+        self.assertEqual(bob.mode("keys.json"), 0o600)
+        # Sealed to a later day's key, it opens with that key.
+        identity = alice.entry()["identity"]
+        later = e2e.seal_message(
+            "Sealed to tomorrow's key", alice.id, bob.id, e2e.unb64(identity["private"]), e2e.unb64(identity["public"]), after["message_keys"][2]
+        )
+        bob.op.trust_key(alice.id)
+        self.assertEqual(
+            bob.op.open({"id": str(uuid4()), "encrypted": later, "sender_agent_id": alice.id}),
+            {"text": "Sealed to tomorrow's key", "verified": True},
+        )
+
+    def test_drops_a_replayed_envelope_but_reads_the_same_message_again_as_often_as_asked(self):
+        server = FakeServer()
+        alice, bob = Agent(server, encryption=True), Agent(server, encryption=True)
+        bob.op.create_keys()
+        sent = alice.op.send_message({"agent_id": bob.id}, "Pay invoice 42")
+        first = bob.op.read_conversation(sent["conversation_id"])
+        again = bob.op.read_conversation(sent["conversation_id"])
+        self.assertEqual(first["data"][0]["opened"], {"text": "Pay invoice 42", "verified": True})
+        self.assertEqual(again["data"][0]["opened"], first["data"][0]["opened"], "a second read is no replay")
+        self.assertEqual(bob.op.chat({"action": "read", "id": sent["id"]})["opened"], first["data"][0]["opened"])
+        self.assertEqual(bob.mode("seen.json"), 0o600)
+        commitment = sent["encrypted"]["commitment"]
+        seen = bob.file("seen.json")[API][bob.id]
+        self.assertEqual(list(seen), [commitment])
+        self.assertEqual(list(seen[commitment]), ["message_id", "opened_at"])
+        self.assertEqual(seen[commitment]["message_id"], sent["id"])
+
+        # Someone posts the same envelope again: it reads as a copy, and the original still reads.
+        copy = {**server.messages[sent["id"]], "id": str(uuid4()), "posted_at": e2e.iso(datetime.now(timezone.utc) + timedelta(seconds=1))}
+        server.messages[copy["id"]] = copy
+        replay = {"text": None, "verified": False, "reason": "a copy of a message already opened"}
+        page = bob.op.read_conversation(sent["conversation_id"])
+        self.assertEqual(
+            [(m["id"], m["opened"]) for m in page["data"]],
+            [(copy["id"], replay), (sent["id"], {"text": "Pay invoice 42", "verified": True})],
+        )
+        self.assertIsNone(bob.op.chat({"action": "read", "id": copy["id"]})["opened"]["text"])
+        self.assertEqual(bob.op.open(copy), replay)
+        # A request carries its message's id, so it reads as that message.
+        request = {"id": str(uuid4()), "message_id": sent["id"], "sender": {"agent_id": alice.id}, "encrypted": sent["encrypted"], "text": None}
+        self.assertEqual(bob.op.open(request), {"text": "Pay invoice 42", "verified": True})
+        # An incoming request still waiting has no message id yet: a fresh envelope reads, and is only
+        # remembered once its message is read; one opened before is a replay.
+        waiting = {"id": str(uuid4()), "direction": "incoming", "sender": {"agent_id": alice.id}, "text": None}
+        fresh = alice.op.seal({"agent_id": bob.id}, "Lunch on Friday?")
+        for _ in range(2):
+            self.assertEqual(bob.op.open({**waiting, "encrypted": fresh}), {"text": "Lunch on Friday?", "verified": True})
+        self.assertEqual(bob.op.open({**waiting, "encrypted": sent["encrypted"]}), replay)
+        with self.assertRaises(EncryptionError) as caught:
+            bob.op.report_conversation(sent["conversation_id"], "spam", reveal=[copy["id"]])
+        self.assertEqual(caught.exception.code, "cant_open")
+        self.assertEqual(list(bob.file("seen.json")[API][bob.id]), [commitment])
+
+        # Seen for the first time in one page, the older of two copies is the one that reads.
+        (bob.dir / "seen.json").write_text("{}")
+        fresh = bob.op.read_conversation(sent["conversation_id"])
+        self.assertEqual([m["opened"]["text"] for m in fresh["data"]], [None, "Pay invoice 42"])
+        # Entries older than 180 days are dropped when it next writes.
+        stale = e2e.iso(datetime.now(timezone.utc) - timedelta(days=181))
+        (bob.dir / "seen.json").write_text(json.dumps({API: {bob.id: {"stale": {"message_id": "m", "opened_at": stale}}}}))
+        bob.op.read_conversation(sent["conversation_id"])
+        self.assertEqual(list(bob.file("seen.json")[API][bob.id]), [commitment])
 
     def test_finds_keys_by_phone_seals_without_sending_and_opens_one_message(self):
         server = FakeServer()
@@ -524,13 +735,16 @@ class EncryptedChatTest(unittest.TestCase):
         mine = alice.op.chat({"action": "publish_keys"})
         method, path, _, body = server.calls[-1]
         self.assertEqual((method, path), ("PUT", "/v1/me/keys"))
-        self.assertEqual(list(body), ["identity_key", "message_key"])
-        self.assertEqual(list(body["message_key"]), ["key_id", "public_key", "expires_at", "signature"])
-        self.assertEqual(alice.op.chat({"action": "keys"}), mine)
+        self.assertEqual(list(body), ["identity_key", "message_keys"])
+        self.assertEqual(len(body["message_keys"]), 7)
+        self.assertEqual(list(body["message_keys"][0]), ["key_id", "public_key", "valid_from", "expires_at", "signature"])
+        self.assertEqual(alice.op.chat({"action": "keys"}), {**mine, "keys_until": body["message_keys"][6]["expires_at"]})
         bob.op.create_keys()
         theirs = alice.op.chat({"action": "agent_keys", "agent_id": bob.id})
         self.assertEqual(server.calls[-1][1], f"/v1/agents/{bob.id}/keys")
         self.assertEqual(list(theirs), ["agent_id", "identity_key", "fingerprint", "message_key", "key_changed"])
+        now = datetime.now(timezone.utc)
+        self.assertTrue(e2e.parse_time(theirs["message_key"]["valid_from"]) <= now < e2e.parse_time(theirs["message_key"]["expires_at"]))
         server.phones["bob@example.com"] = bob.id
         self.assertEqual(alice.op.chat({"action": "key_lookup", "to": {"email": "bob@example.com"}})["agent_id"], bob.id)
         with self.assertRaises(ValueError):

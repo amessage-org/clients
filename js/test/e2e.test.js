@@ -8,94 +8,119 @@ import { describe, it } from "node:test";
 import { AMessage, AMessageError, EncryptionError } from "../index.js";
 import * as e2e from "../e2e.js";
 
-const hex = (s) => Buffer.from(s.replace(/\s/g, ""), "hex");
+const hex = (s) => Buffer.from(s, "hex");
 const VECTORS = JSON.parse(
   await readFile(new URL("../../test-vectors/encrypted-chats-vectors.json", import.meta.url), "utf8"),
 );
 
-// RFC 9180, Appendix A.1: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM, base mode.
-const A1 = {
-  info: hex("4f6465206f6e2061204772656369616e2055726e"),
-  ikmE: hex("7268600d403fce431561aef583ee1613527cff655c1343f29812e66706df3234"),
-  pkEm: "37fda3567bdbd628e88668c3c8d7e97d1d1253b6d4ea6d44c150f741f1bf4431",
-  skEm: "52c4a758a802cd8b936eceea314432798d5baf2d7e9235dc084ab1b9cfa2f736",
-  ikmR: hex("6db9df30aa07dd42ee5e8181afdb977e538f5e1fec8a06223f33f7013e525037"),
-  pkRm: "3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d",
-  skRm: "4612c550263fc8ad58375df3f557aac531d26850903e55a9f23f21d8534e8ac8",
-  sharedSecret: "fe0e18c9f024ce43799ae393c7e8fe8fce9d218875e8227b0187c04e7d2ea1fc",
-  key: "4531685d41d65f03dc48f6b8302c05b0",
-  baseNonce: "56d890e5accaaf011cff4b7d",
-  pt: hex("4265617574792069732074727574682c20747275746820626561757479"),
-  aad: hex("436f756e742d30"),
-  ct: "f938558b5d72f1a23810b4be2ab4f84331acc02fc97babc53a52ae8218a355a96d8770ac83d07bea87e13c512a",
-};
-
 describe("the building blocks", () => {
-  it("matches RFC 9180 A.1: derived keys, shared secret, key schedule and the first seal", () => {
-    const e = e2e.deriveX25519(A1.ikmE);
-    const r = e2e.deriveX25519(A1.ikmR);
-    assert.equal(e.publicKey.toString("hex"), A1.pkEm);
-    assert.equal(e.privateKey.toString("hex"), A1.skEm);
-    assert.equal(r.publicKey.toString("hex"), A1.pkRm);
-    assert.equal(r.privateKey.toString("hex"), A1.skRm);
-    const sealed = e2e.hpkeSeal(r.publicKey, A1.info, A1.aad, A1.pt, e);
-    assert.equal(sealed.enc.toString("hex"), A1.pkEm);
-    const schedule = e2e.inspect(sealed.enc, r.privateKey, A1.info);
-    assert.equal(schedule.shared.toString("hex"), A1.sharedSecret);
-    assert.equal(schedule.key.toString("hex"), A1.key);
-    assert.equal(schedule.nonce.toString("hex"), A1.baseNonce);
-    assert.equal(sealed.ct.toString("hex"), A1.ct);
-    assert.deepEqual(e2e.hpkeOpen(r.privateKey, sealed.enc, A1.info, A1.aad, sealed.ct), A1.pt);
-    const tampered = Buffer.from(sealed.ct);
+  it("matches draft-ietf-hpke-pq A.5: the public key, shared secret, key schedule and both messages", () => {
+    const h = VECTORS.hpke;
+    assert.equal(e2e.messagePublicOf(hex(h.skRm)).toString("hex"), h.pkRm);
+    const schedule = e2e.inspect(hex(h.skRm), hex(h.enc), hex(h.info));
+    assert.equal(schedule.shared.toString("hex"), h.shared_secret);
+    assert.equal(schedule.key.toString("hex"), h.key);
+    assert.equal(schedule.nonce.toString("hex"), h.base_nonce);
+    assert.equal(h.encryptions.length, 2);
+    for (const m of h.encryptions)
+      assert.equal(e2e.openAt(hex(h.skRm), hex(h.enc), hex(h.info), hex(m.aad), hex(m.ct), hex(m.nonce)).toString("hex"), m.pt);
+    // The first message is the one a single-shot open reads, with the base nonce.
+    const [first] = h.encryptions;
+    assert.equal(e2e.hpkeOpen(hex(h.skRm), hex(h.enc), hex(h.info), hex(first.aad), hex(first.ct)).toString("hex"), first.pt);
+    const tampered = hex(first.ct);
     tampered[0] ^= 1;
-    assert.throws(() => e2e.hpkeOpen(r.privateKey, sealed.enc, A1.info, A1.aad, tampered));
+    assert.throws(() => e2e.openAt(hex(h.skRm), hex(h.enc), hex(h.info), hex(first.aad), tampered, hex(first.nonce)));
+    const otherEnc = hex(h.enc);
+    otherEnc[otherEnc.length - 1] ^= 1;
+    assert.throws(() => e2e.hpkeOpen(hex(h.skRm), otherEnc, hex(h.info), hex(first.aad), hex(first.ct)));
   });
 
-  it("seals the spec's test vectors to the same envelope, byte for byte, and opens them to the payload", () => {
+  it("reproduces the vector file's identities, day key and signatures byte for byte, and opens its envelope", () => {
     const v = VECTORS;
     const u = e2e.unb64;
     for (const who of [v.alice_identity, v.bob_identity]) {
       assert.equal(e2e.b64(e2e.identityPublicOf(u(who.private))), who.public);
       assert.equal(e2e.fingerprint(u(who.public)), who.fingerprint);
     }
-    const bobKey = v.bob_message_key;
-    assert.equal(e2e.b64(e2e.x25519PublicOf(u(bobKey.private))), bobKey.public_key);
-    assert.equal(e2e.keyId(u(bobKey.public_key)), bobKey.key_id);
-    assert.equal(
-      e2e.signWith(u(v.bob_identity.private), e2e.messageKeyStatement(bobKey.public_key, bobKey.expires_at)),
-      bobKey.signature,
-    );
-    assert.equal(e2e.checkKeys({ ...v.bob_identity, identity_key: v.bob_identity.public, message_key: bobKey }), true);
+    const { private_seed, statement, ...published } = v.bob_day_key;
+    assert.equal(e2e.b64(e2e.messagePublicOf(u(private_seed))), published.public_key);
+    assert.equal(e2e.keyId(u(published.public_key)), published.key_id);
+    assert.equal(e2e.messageKeyStatement(published.public_key, published.valid_from, published.expires_at), statement);
+    assert.equal(e2e.signWith(u(v.bob_identity.private), statement), published.signature);
+    // Any moment of the day gives the same day key.
+    const day = e2e.messageKeyFor(u(v.bob_identity.private), u(private_seed), new Date("2026-12-01T18:00:00Z"));
+    assert.equal(JSON.stringify(day.public), JSON.stringify(published));
+    assert.equal(e2e.checkKeys({ ...v.bob_identity, identity_key: v.bob_identity.public, message_key: published }), true);
+
+    assert.equal(e2e.isEnvelope(v.envelope), true);
+    assert.equal(e2e.envelopeStatement(v.envelope), v.envelope_statement);
+    assert.equal(e2e.associatedData(v.envelope.sender_key, v.envelope.recipient_key).toString(), v.associated_data);
+    assert.equal(e2e.verifyWith(u(v.alice_identity.public), v.envelope_statement, v.envelope.sig), true);
     const payload = JSON.parse(v.plaintext_payload);
-    const ephemeral = u(v.ephemeral_private);
-    const envelope = e2e.sealMessage({
-      text: payload.text,
-      from: payload.from,
-      to: payload.to,
-      identityPrivate: u(v.alice_identity.private),
-      identityPublic: u(v.alice_identity.public),
-      recipientKey: bobKey,
-      now: new Date(v.sent_at),
-      ephemeral: { privateKey: ephemeral, publicKey: e2e.x25519PublicOf(ephemeral) },
-      frankingKey: u(v.franking_key),
-    });
-    assert.equal(JSON.stringify(envelope), JSON.stringify(v.envelope));
-    assert.equal(e2e.isEnvelope(envelope), true);
     const opened = e2e.openMessage({
       envelope: v.envelope,
-      messagePrivate: u(bobKey.private),
+      messagePrivate: u(private_seed),
       senderIdentityPublic: u(v.alice_identity.public),
       me: payload.to,
       sender: payload.from,
     });
     assert.equal(JSON.stringify(opened), v.plaintext_payload);
     assert.equal(e2e.revealMatches(opened.franking_key, opened.text, v.envelope.commitment), true);
+
+    // Sealing the same payload again takes fresh randomness: a new seal, the same commitment.
+    const again = e2e.sealMessage({
+      text: payload.text,
+      from: payload.from,
+      to: payload.to,
+      identityPrivate: u(v.alice_identity.private),
+      identityPublic: u(v.alice_identity.public),
+      recipientKey: published,
+      now: new Date(v.sent_at),
+      frankingKey: u(v.franking_key),
+    });
+    assert.deepEqual(Object.keys(again), Object.keys(v.envelope));
+    assert.equal(again.commitment, v.envelope.commitment);
+    assert.notEqual(again.enc, v.envelope.enc);
+    const reopened = e2e.openMessage({
+      envelope: again,
+      messagePrivate: u(private_seed),
+      senderIdentityPublic: u(v.alice_identity.public),
+      me: payload.to,
+      sender: payload.from,
+    });
+    assert.equal(JSON.stringify(reopened), v.plaintext_payload);
+  });
+
+  it("makes a key for each UTC day, signed with both of its dates", () => {
+    const bob = e2e.generateIdentity();
+    const keys = e2e.newMessageKeys(bob.privateKey, new Date("2026-12-03T10:00:00Z"));
+    assert.equal(keys.length, e2e.DAYS_AHEAD);
+    assert.deepEqual(
+      keys.map((k) => [k.public.valid_from, k.public.expires_at]),
+      Array.from({ length: 7 }, (_, i) => [
+        new Date(Date.UTC(2026, 11, 3 + i)).toISOString(),
+        new Date(Date.UTC(2026, 11, 4 + i)).toISOString(),
+      ]),
+    );
+    for (const k of keys) {
+      assert.equal(k.privateKey.length, e2e.SEED_BYTES);
+      assert.equal(e2e.unb64(k.public.public_key).length, e2e.PUBLIC_BYTES);
+      assert.equal(e2e.checkMessageKey(bob.publicKey, k.public), true);
+    }
+    assert.equal(new Set(keys.map((k) => k.public.key_id)).size, 7);
+    assert.equal(e2e.dayStart(new Date("2026-12-03T23:59:59.999Z")).toISOString(), "2026-12-03T00:00:00.000Z");
+    const [today] = keys;
+    const noon = new Date(Date.parse(today.public.valid_from) + 43_200_000).toISOString();
+    assert.equal(e2e.checkMessageKey(bob.publicKey, { ...today.public, valid_from: noon }), false, "not a whole day");
+    assert.equal(e2e.checkMessageKey(bob.publicKey, { ...today.public, expires_at: keys[1].public.expires_at }), false);
+    assert.equal(e2e.checkMessageKey(e2e.generateIdentity().publicKey, today.public), false, "someone else's signature");
+    assert.equal(e2e.checkMessageKey(bob.publicKey, { ...today.public, key_id: "0".repeat(32) }), false);
   });
 
   it("opens a sealed message for its recipient only, and refuses every kind of tampering", () => {
     const alice = e2e.generateIdentity();
     const bob = e2e.generateIdentity();
-    const bobKey = e2e.newMessageKey(bob.privateKey);
+    const [bobKey, tomorrow] = e2e.newMessageKeys(bob.privateKey);
     const envelope = e2e.sealMessage({
       text: "Can you check the build log? Ünïcödé ✓",
       from: "alice-id",
@@ -104,22 +129,34 @@ describe("the building blocks", () => {
       identityPublic: alice.publicKey,
       recipientKey: bobKey.public,
     });
-    const read = (e = envelope, me = "bob-id", sender = "alice-id", from = alice.publicKey) =>
-      e2e.openMessage({ envelope: e, messagePrivate: bobKey.privateKey, senderIdentityPublic: from, me, sender });
+    assert.equal(e2e.isEnvelope(envelope), true);
+    assert.equal(e2e.unb64(envelope.enc).length, e2e.ENC_BYTES);
+    const read = (e = envelope, me = "bob-id", sender = "alice-id", from = alice.publicKey, key = bobKey.privateKey) =>
+      e2e.openMessage({ envelope: e, messagePrivate: key, senderIdentityPublic: from, me, sender });
     const payload = read();
     assert.equal(payload.text, "Can you check the build log? Ünïcödé ✓");
     assert.equal(e2e.revealMatches(payload.franking_key, "Something else", envelope.commitment), false);
     const flip = (s) => e2e.b64(Buffer.from(e2e.unb64(s).map((byte, i) => (i === 0 ? byte ^ 1 : byte))));
-    assert.throws(() => read({ ...envelope, ct: flip(envelope.ct) }));
+    const resign = (e) => {
+      const { v, sig, ...unsigned } = e;
+      return { ...e, sig: e2e.signWith(alice.privateKey, e2e.envelopeStatement(unsigned)) };
+    };
+    assert.throws(() => read({ ...envelope, ct: flip(envelope.ct) }), /signature/);
+    assert.throws(() => read(resign({ ...envelope, ct: flip(envelope.ct) })), "a changed ct, signed again, still won't open");
+    assert.throws(() => read(resign({ ...envelope, enc: flip(envelope.enc) })));
     assert.throws(() => read({ ...envelope, commitment: flip(envelope.commitment) }), /signature/);
     assert.throws(() => read(envelope, "carol-id"), /other agents/);
     assert.throws(() => read(envelope, "bob-id", "mallory-id"), /other agents/);
     assert.throws(() => read(envelope, "bob-id", "alice-id", bob.publicKey), /sender's key/);
+    assert.throws(() => read(envelope, "bob-id", "alice-id", alice.publicKey, tomorrow.privateKey), "another day's key can't open it");
     const mallory = e2e.generateIdentity();
     const resigned = { ...envelope, sender_key: e2e.fingerprint(mallory.publicKey), sig: e2e.b64(Buffer.alloc(64)) };
     assert.throws(() => read(resigned, "bob-id", "alice-id", mallory.publicKey), /signature/);
     assert.equal(e2e.isEnvelope({ ...envelope, extra: 1 }), false);
-    assert.equal(e2e.isEnvelope({ ...envelope, v: 2 }), false);
+    assert.equal(e2e.isEnvelope({ ...envelope, v: 1 }), false);
+    assert.equal(e2e.isEnvelope({ ...envelope, suite: "x25519-hkdf-sha256-aes128gcm" }), false);
+    assert.equal(e2e.isEnvelope({ ...envelope, enc: e2e.b64(Buffer.alloc(32)) }), false);
+    assert.equal(e2e.isEnvelope({ ...envelope, sig: e2e.b64(Buffer.alloc(32)) }), false);
     const seal = (text) =>
       e2e.sealMessage({
         text,
@@ -131,6 +168,7 @@ describe("the building blocks", () => {
       });
     // 2,000 characters fit in any script; 2,001 don't.
     assert.ok(Buffer.byteLength(JSON.stringify(seal("😀".repeat(2000)))) <= e2e.MAX_ENVELOPE_BYTES);
+    assert.ok(Buffer.byteLength(JSON.stringify(seal("界".repeat(2000)))) <= e2e.MAX_ENVELOPE_BYTES);
     assert.throws(() => seal("a".repeat(2001)), RangeError);
   });
 
@@ -160,13 +198,20 @@ function fakeServer() {
   const reports = [];
   const calls = [];
   const refuseNext = [];
-  // Agents whose weekly message key lapsed: no keys to seal to, but an identity still.
+  // Agents whose day keys ran out: no key for today to seal to, but an identity still.
   const lapsed = new Set();
   const problem = (status, code) => Response.json({ code, detail: `Refused: ${code}.` }, { status });
+  /** Today's key, as GET /v1/agents/{id}/keys answers. */
   const published = (agentId) => {
     const k = lapsed.has(agentId) ? null : keys.get(agentId);
-    return k && { agent_id: agentId, identity_key: k.identity_key, fingerprint: k.fingerprint, message_key: k.message_keys.at(-1) };
+    const now = Date.now();
+    const today = k?.message_keys
+      .filter((m) => Date.parse(m.valid_from) <= now && Date.parse(m.expires_at) > now)
+      .sort((a, b) => Date.parse(b.valid_from) - Date.parse(a.valid_from))[0];
+    return today && { agent_id: agentId, identity_key: k.identity_key, fingerprint: k.fingerprint, message_key: today };
   };
+  const keysUntil = (agentId) =>
+    new Date(Math.max(...keys.get(agentId).message_keys.map((m) => Date.parse(m.expires_at)))).toISOString();
   const chatBetween = (a, b) => {
     for (const c of conversations.values()) if (c.agents.includes(a) && c.agents.includes(b)) return c;
     const c = { id: randomUUID(), agents: [a, b], encrypted: false };
@@ -192,16 +237,24 @@ function fakeServer() {
       return Response.json({ agent_id: me, inbox_id: me, name: null, linked_to_account: false, encryption });
     }
     if (path === "/v1/me/keys" && method === "PUT") {
-      const fingerprint = e2e.fingerprint(e2e.unb64(body.identity_key));
-      if (!e2e.checkKeys({ ...body, fingerprint })) return problem(422, "invalid_keys");
+      const identity = e2e.unb64(body.identity_key);
+      const fingerprint = e2e.fingerprint(identity);
+      const days = body.message_keys;
+      if (identity.length !== 32 || !Array.isArray(days) || !days.length || days.length > 14)
+        return problem(400, "bad_request");
+      if (!days.every((m) => e2e.checkMessageKey(identity, m) && Date.parse(m.expires_at) > Date.now()))
+        return problem(400, "bad_request");
       const before = keys.get(me);
+      // A new identity key replaces the old one, and the old one's day keys stop taking messages.
       if (!before || before.identity_key !== body.identity_key)
-        keys.set(me, { identity_key: body.identity_key, fingerprint, message_keys: [body.message_key] });
-      else if (before.message_keys.at(-1).key_id !== body.message_key.key_id) before.message_keys.push(body.message_key);
+        keys.set(me, { identity_key: body.identity_key, fingerprint, message_keys: [] });
+      const held = keys.get(me).message_keys;
+      for (const m of days) if (!held.some((k) => k.key_id === m.key_id)) held.push(m);
       lapsed.delete(me);
-      return Response.json(published(me));
+      return published(me) ? Response.json(published(me)) : problem(400, "bad_request");
     }
-    if (path === "/v1/me/keys") return published(me) ? Response.json(published(me)) : problem(404, "not_found");
+    if (path === "/v1/me/keys")
+      return published(me) ? Response.json({ ...published(me), keys_until: keysUntil(me) }) : problem(404, "not_found");
     const agentKeys = path.match(/^\/v1\/agents\/([^/]+)\/keys$/);
     if (agentKeys) {
       const answer = published(decodeURIComponent(agentKeys[1]));
@@ -246,8 +299,9 @@ function fakeServer() {
         if (!sender || env.sender_key !== sender.fingerprint) return problem(409, "stale_key");
         if (!e2e.verifyWith(e2e.unb64(sender.identity_key), e2e.envelopeStatement(env), env.sig))
           return problem(422, "invalid_envelope");
+        const now = Date.now();
         const usable = (recipient?.message_keys ?? []).filter(
-          (k) => Date.parse(k.expires_at) + e2e.DAY_MS > Date.now(),
+          (k) => Date.parse(k.expires_at) + e2e.DAY_MS > now && Date.parse(k.valid_from) <= now + e2e.DAY_MS,
         );
         if (!usable.some((k) => k.key_id === env.recipient_key)) return problem(409, "stale_key");
         c.encrypted = true;
@@ -298,10 +352,37 @@ describe("encrypted chats between two agents", () => {
     const entry = (await json(file))["https://api.amessage.sh"][bob.id];
     assert.deepEqual(Object.keys(entry), ["identity", "message_keys", "pins"]);
     assert.deepEqual(Object.keys(entry.identity), ["private", "public"]);
-    assert.deepEqual(Object.keys(entry.message_keys[0]), ["key_id", "private", "public_key", "expires_at", "signature"]);
+    assert.equal(entry.message_keys.length, 7, "a key for each of the next 7 days");
+    assert.deepEqual(Object.keys(entry.message_keys[0]), [
+      "key_id",
+      "private",
+      "public_key",
+      "valid_from",
+      "expires_at",
+      "signature",
+    ]);
+    const today = e2e.dayStart(new Date()).getTime();
+    assert.deepEqual(
+      entry.message_keys.map((k) => k.valid_from),
+      Array.from({ length: 7 }, (_, i) => new Date(today + i * e2e.DAY_MS).toISOString()),
+    );
+    for (const k of entry.message_keys) assert.equal(e2e.unb64(k.private).length, e2e.SEED_BYTES);
+    const put = server.calls.findLast((c) => c.method === "PUT" && c.path === "/v1/me/keys");
+    assert.deepEqual(Object.keys(put.body), ["identity_key", "message_keys"]);
+    assert.deepEqual(
+      put.body.message_keys,
+      entry.message_keys.map(({ private: _, ...half }) => half),
+      "the public halves of all 7 days, in order",
+    );
     assert.equal(published.fingerprint, e2e.fingerprint(e2e.unb64(entry.identity.public)));
-    assert.deepEqual(await bob.op.keys(), published);
+    assert.equal(published.message_key.key_id, entry.message_keys[0].key_id, "today's key");
+    assert.deepEqual(await bob.op.keys(), { ...published, keys_until: entry.message_keys[6].expires_at });
     assert.equal((await bob.op.createKeys()).fingerprint, published.fingerprint, "a second call keeps the identity");
+    assert.deepEqual(
+      (await json(file))["https://api.amessage.sh"][bob.id].message_keys.map((k) => k.key_id),
+      entry.message_keys.map((k) => k.key_id),
+      "and makes no new keys for days it has",
+    );
 
     const sent = await alice.op.sendMessage({ agent_id: bob.id }, "Can you check the build log?");
     assert.equal(sent.text, null);
@@ -356,7 +437,7 @@ describe("encrypted chats between two agents", () => {
     for (const secret of privates) assert.equal(wire.includes(secret), false);
   });
 
-  it("won't publish over keys another machine holds, even when their message key lapsed, unless told to replace them", async () => {
+  it("won't publish over keys another machine holds, even when their day keys ran out, unless told to replace them", async () => {
     const server = fakeServer();
     const first = await agent(server, { encryption: true });
     const bob = await agent(server, { encryption: true });
@@ -371,7 +452,7 @@ describe("encrypted chats between two agents", () => {
       token: `agt_${first.id}`,
       encryption: true,
     });
-    assert.equal(await second.keys(), null, "GET /v1/me/keys says nothing once the message key lapsed");
+    assert.equal(await second.keys(), null, "GET /v1/me/keys says nothing without a key for today");
     const puts = () => server.calls.filter((c) => c.method === "PUT" && c.path === "/v1/me/keys").length;
     const before = puts();
     await assert.rejects(second.createKeys(), (error) => {
@@ -384,16 +465,15 @@ describe("encrypted chats between two agents", () => {
     });
     await assert.rejects(second.sendMessage({ agent_id: bob.id }, "Hi"), { code: "keys_elsewhere" });
     await assert.rejects(second.chat({ action: "publish_keys" }), { code: "keys_elsewhere" });
-    await assert.rejects(second.rotateKeys(), { code: "keys_elsewhere" });
     assert.equal(puts(), before, "nothing was published");
     assert.equal(server.keys.get(first.id).fingerprint, original);
     // The machine that holds them publishes as before.
-    assert.equal((await first.op.rotateKeys()).fingerprint, original);
+    assert.equal((await first.op.createKeys()).fingerprint, original);
     // replace: true takes them over, and then the first machine can't take them back unasked.
     const replaced = await second.createKeys({ replace: true });
     assert.notEqual(replaced.fingerprint, original);
-    await assert.rejects(first.op.rotateKeys(), { code: "keys_elsewhere" });
     await assert.rejects(first.op.createKeys(), { code: "keys_elsewhere" });
+    await assert.rejects(first.op.chat({ action: "publish_keys" }), { code: "keys_elsewhere" });
     assert.equal(server.keys.get(first.id).fingerprint, replaced.fingerprint);
   });
 
@@ -464,38 +544,119 @@ describe("encrypted chats between two agents", () => {
     assert.equal((await alice.op.readConversation(first.conversation_id)).data[1].opened.verified, true);
   });
 
-  it("makes the next message key when a day is left, keeps the old private key, and drops long-ended ones", async () => {
+  it("publishes the next days when fewer than 3 are left, keeps private day keys 180 days, and drops version 1 keys", async () => {
     const server = fakeServer();
     const alice = await agent(server, { encryption: true });
     const bob = await agent(server, { encryption: true });
     await bob.op.createKeys();
-    const early = await alice.op.sendMessage({ agent_id: bob.id }, "Sealed to the first key");
+    const early = await alice.op.sendMessage({ agent_id: bob.id }, "Sealed to today's key");
     const file = join(bob.dir, "keys.json");
+    const puts = () => server.calls.filter((c) => c.method === "PUT" && c.path === "/v1/me/keys");
     const all = await json(file);
     const keys = all["https://api.amessage.sh"][bob.id].message_keys;
-    const ancient = { ...keys[0], key_id: "0".repeat(32), expires_at: new Date(Date.now() - 181 * e2e.DAY_MS).toISOString() };
-    keys[0].expires_at = new Date(Date.now() + 3_600_000).toISOString();
-    keys.unshift(ancient);
+    const today = keys[0];
+    // Three days left: nothing to publish yet.
+    all["https://api.amessage.sh"][bob.id].message_keys = keys.slice(0, 4);
     await writeFile(file, JSON.stringify(all));
-    const puts = () => server.calls.filter((c) => c.method === "PUT" && c.path === "/v1/me/keys").length;
-    const before = puts();
+    let before = puts().length;
     await bob.op.readConversation(early.conversation_id);
-    assert.equal(puts(), before + 1, "reading rotated the key");
-    const after = (await json(file))["https://api.amessage.sh"][bob.id].message_keys;
+    assert.equal(puts().length, before, "three days left is enough");
+    // Two days left, an ancient key and a key of version 1: reading publishes, and tidies.
+    const ancient = { ...today, key_id: "0".repeat(32), valid_from: new Date(Date.now() - 182 * e2e.DAY_MS).toISOString(), expires_at: new Date(Date.now() - 181 * e2e.DAY_MS).toISOString() };
+    const kept = { ...today, key_id: "1".repeat(32), valid_from: new Date(Date.now() - 171 * e2e.DAY_MS).toISOString(), expires_at: new Date(Date.now() - 170 * e2e.DAY_MS).toISOString() };
+    const version1 = { key_id: "2".repeat(32), private: today.private, public_key: "abc", expires_at: new Date(Date.now() + e2e.DAY_MS).toISOString(), signature: "abc" };
+    all["https://api.amessage.sh"][bob.id].message_keys = [version1, ancient, kept, ...keys.slice(0, 2)];
+    all["https://api.amessage.sh"][bob.id].pins = { [alice.id]: "a".repeat(64) };
+    await writeFile(file, JSON.stringify(all));
+    before = puts().length;
+    const page = await bob.op.readConversation(early.conversation_id);
+    assert.deepEqual(page.data[0].opened, { text: "Sealed to today's key", verified: false, reason: "their key changed since your first chat" }, "pins stayed");
+    assert.equal(puts().length, before + 1, "reading published the next days");
+    const published = puts().at(-1).body.message_keys;
+    assert.equal(published.length, 7);
+    assert.deepEqual(published.slice(0, 2).map((k) => k.key_id), keys.slice(0, 2).map((k) => k.key_id), "the days it had, again");
+    const after = (await json(file))["https://api.amessage.sh"][bob.id];
+    assert.deepEqual(Object.keys(after), ["identity", "message_keys", "pins"]);
     assert.deepEqual(
-      after.map((k) => k.key_id),
-      [keys[1].key_id, server.keys.get(bob.id).message_keys.at(-1).key_id],
+      after.message_keys.map((k) => k.key_id),
+      [kept.key_id, ...published.map((k) => k.key_id)],
+      "version 1 and 181-day-old keys are gone; one 170 days old stays",
     );
     assert.equal(await mode(file), 0o600);
-    const late = await alice.op.sendMessage({ agent_id: bob.id }, "Sealed to the next key");
-    assert.equal(late.encrypted.recipient_key, after[1].key_id);
-    const page = await bob.op.readConversation(early.conversation_id);
+    // Sealed to a later day's key, it opens with that key.
+    const aliceIdentity = (await json(join(alice.dir, "keys.json")))["https://api.amessage.sh"][alice.id].identity;
+    const later = e2e.sealMessage({
+      text: "Sealed to tomorrow's key",
+      from: alice.id,
+      to: bob.id,
+      identityPrivate: e2e.unb64(aliceIdentity.private),
+      identityPublic: e2e.unb64(aliceIdentity.public),
+      recipientKey: after.message_keys[2],
+    });
+    await bob.op.trustKey(alice.id);
+    assert.deepEqual(await bob.op.open({ id: randomUUID(), encrypted: later, sender_agent_id: alice.id }), {
+      text: "Sealed to tomorrow's key",
+      verified: true,
+    });
+  });
+
+  it("drops a replayed envelope, but reads the same message again as often as asked", async () => {
+    const server = fakeServer();
+    const alice = await agent(server, { encryption: true });
+    const bob = await agent(server, { encryption: true });
+    await bob.op.createKeys();
+    const sent = await alice.op.sendMessage({ agent_id: bob.id }, "Pay invoice 42");
+    const first = await bob.op.readConversation(sent.conversation_id);
+    const again = await bob.op.readConversation(sent.conversation_id);
+    assert.deepEqual(first.data[0].opened, { text: "Pay invoice 42", verified: true });
+    assert.deepEqual(again.data[0].opened, first.data[0].opened, "a second read is no replay");
+    assert.deepEqual((await bob.op.chat({ action: "read", id: sent.id })).opened, first.data[0].opened);
+    const seenFile = join(bob.dir, "seen.json");
+    assert.equal(await mode(seenFile), 0o600);
+    const seen = (await json(seenFile))["https://api.amessage.sh"][bob.id];
+    assert.deepEqual(Object.keys(seen), [sent.encrypted.commitment]);
+    assert.deepEqual(Object.keys(seen[sent.encrypted.commitment]), ["message_id", "opened_at"]);
+    assert.equal(seen[sent.encrypted.commitment].message_id, sent.id);
+
+    // Someone posts the same envelope again: it reads as a copy, and the original still reads.
+    const copy = { ...server.messages.get(sent.id), id: randomUUID(), posted_at: new Date(Date.now() + 1000).toISOString() };
+    server.messages.set(copy.id, copy);
+    const page = await bob.op.readConversation(sent.conversation_id);
     assert.deepEqual(
-      page.data.map((m) => m.opened.text),
-      ["Sealed to the next key", "Sealed to the first key"],
+      page.data.map((m) => [m.id, m.opened]),
+      [
+        [copy.id, { text: null, verified: false, reason: "a copy of a message already opened" }],
+        [sent.id, { text: "Pay invoice 42", verified: true }],
+      ],
     );
-    await bob.op.rotateKeys();
-    assert.equal((await json(file))["https://api.amessage.sh"][bob.id].message_keys.length, 3);
+    assert.equal((await bob.op.chat({ action: "read", id: copy.id })).opened.text, null);
+    assert.deepEqual(await bob.op.open(copy), { text: null, verified: false, reason: "a copy of a message already opened" });
+    // A request carries its message's id, so it reads as that message.
+    const request = { id: randomUUID(), message_id: sent.id, sender: { agent_id: alice.id }, encrypted: sent.encrypted, text: null };
+    assert.deepEqual(await bob.op.open(request), { text: "Pay invoice 42", verified: true });
+    // An incoming request still waiting has no message id yet: a fresh envelope reads, and is only
+    // remembered once its message is read; one opened before is a replay.
+    const waiting = { id: randomUUID(), direction: "incoming", sender: { agent_id: alice.id }, text: null };
+    const fresh = await alice.op.seal({ agent_id: bob.id }, "Lunch on Friday?");
+    assert.deepEqual(await bob.op.open({ ...waiting, encrypted: fresh }), { text: "Lunch on Friday?", verified: true });
+    assert.deepEqual(await bob.op.open({ ...waiting, encrypted: fresh }), { text: "Lunch on Friday?", verified: true });
+    assert.deepEqual(await bob.op.open({ ...waiting, encrypted: sent.encrypted }), {
+      text: null,
+      verified: false,
+      reason: "a copy of a message already opened",
+    });
+    await assert.rejects(bob.op.reportConversation(sent.conversation_id, "spam", { reveal: [copy.id] }), { code: "cant_open" });
+    assert.deepEqual(Object.keys((await json(seenFile))["https://api.amessage.sh"][bob.id]), [sent.encrypted.commitment]);
+
+    // Seen for the first time in one page, the older of two copies is the one that reads.
+    await writeFile(seenFile, "{}");
+    const firstTime = await bob.op.readConversation(sent.conversation_id);
+    assert.deepEqual(firstTime.data.map((m) => m.opened.text), [null, "Pay invoice 42"]);
+    // Entries older than 180 days are dropped when it next writes.
+    const old = { "https://api.amessage.sh": { [bob.id]: { stale: { message_id: "m", opened_at: new Date(Date.now() - 181 * e2e.DAY_MS).toISOString() } } } };
+    await writeFile(seenFile, JSON.stringify(old));
+    await bob.op.readConversation(sent.conversation_id);
+    assert.deepEqual(Object.keys((await json(seenFile))["https://api.amessage.sh"][bob.id]), [sent.encrypted.commitment]);
   });
 
   it("finds keys by phone, seals without sending, and opens one message", async () => {
@@ -560,13 +721,16 @@ describe("encrypted chats between two agents", () => {
     const mine = await alice.op.chat({ action: "publish_keys" });
     const put = server.calls.at(-1);
     assert.equal(`${put.method} ${put.path}`, "PUT /v1/me/keys");
-    assert.deepEqual(Object.keys(put.body), ["identity_key", "message_key"]);
-    assert.deepEqual(Object.keys(put.body.message_key), ["key_id", "public_key", "expires_at", "signature"]);
-    assert.deepEqual(await alice.op.chat({ action: "keys" }), mine);
+    assert.deepEqual(Object.keys(put.body), ["identity_key", "message_keys"]);
+    assert.equal(put.body.message_keys.length, 7);
+    assert.deepEqual(Object.keys(put.body.message_keys[0]), ["key_id", "public_key", "valid_from", "expires_at", "signature"]);
+    const shown = await alice.op.chat({ action: "keys" });
+    assert.deepEqual(shown, { ...mine, keys_until: put.body.message_keys[6].expires_at });
     await bob.op.createKeys();
     const theirs = await alice.op.chat({ action: "agent_keys", agent_id: bob.id });
     assert.equal(server.calls.at(-1).path, `/v1/agents/${bob.id}/keys`);
     assert.deepEqual(Object.keys(theirs), ["agent_id", "identity_key", "fingerprint", "message_key", "key_changed"]);
+    assert.ok(Date.parse(theirs.message_key.valid_from) <= Date.now() && Date.now() < Date.parse(theirs.message_key.expires_at));
     server.phones.set("bob@example.com", bob.id);
     assert.equal((await alice.op.chat({ action: "key_lookup", to: { email: "bob@example.com" } })).agent_id, bob.id);
     await assert.rejects(alice.op.chat({ action: "key_lookup" }), /requires to/);

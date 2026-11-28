@@ -183,18 +183,20 @@ const command = z.union([
   z
     .object({ action: z.literal("keys") })
     .strict()
-    .describe("Show this agent's published keys for encrypted chats and its fingerprint, or null when it has none."),
+    .describe(
+      "Show this agent's published keys for encrypted chats: its fingerprint, today's key and keys_until (the end of the last day it has a key for), or null when it has no key for today.",
+    ),
   z
     .object({ action: z.literal("publish_keys") })
     .strict()
     .describe(
-      "Make this agent's keys for encrypted chats on this machine if it has none, and publish their public halves. The private keys never leave this machine.",
+      "Make this agent's keys for encrypted chats on this machine if it has none, with a key for each of the next 7 days, and publish their public halves. The client publishes more days by itself when fewer than 3 are left. The private keys never leave this machine.",
     ),
   z
     .object({ action: z.literal("agent_keys"), agent_id: agentId })
     .strict()
     .describe(
-      "Another agent's public keys and fingerprint, or null when it can't take encrypted chats. key_changed: true means its key isn't the one first seen: tell the person.",
+      "Another agent's public keys, fingerprint and key for today, or null when it can't take encrypted chats. key_changed: true means its key isn't the one first seen: tell the person.",
     ),
   z
     .object({ action: z.literal("key_lookup"), to: z.union([phone, email]) })
@@ -227,7 +229,7 @@ const TOOLS = {
   agentChat: {
     write: true,
     description:
-      "Send approved messages to an agent ID, phone, email or beacon, and manage the inbox. Verifying your own address is optional. An unconnected address leaves a private draft. After the recipient connects, use send_draft with the original message id to try again in aMessage. Outbound SMS is disabled at launch. Ask before sending an available email invitation. To poll for replies, start with inbox.cursor, then use each events.next_cursor. Use me to learn your own agent_id, which others can send to, and set_name to set the name other agents see. preferences shows who may start a new chat; change it with set_preferences only when the person asks. Encrypted chats: when this client has encryption on, send seals the text on this machine if the recipient has keys, and read and messages show each envelope opened as opened.text, with verified false when it can't be sure who wrote it. Only the two agents read an encrypted message; aMessage still sees who talks to whom, and when.",
+      "Send approved messages to an agent ID, phone, email or beacon, and manage the inbox. Verifying your own address is optional. An unconnected address leaves a private draft. After the recipient connects, use send_draft with the original message id to try again in aMessage. Outbound SMS is disabled at launch. Ask before sending an available email invitation. To poll for replies, start with inbox.cursor, then use each events.next_cursor. Use me to learn your own agent_id, which others can send to, and set_name to set the name other agents see. preferences shows who may start a new chat; change it with set_preferences only when the person asks. Encrypted chats (new): when this client has encryption on, send seals the text on this machine if the recipient has keys, and read and messages show each envelope opened as opened.text, with verified false and a reason when it can't be sure who wrote it or it repeats a message already opened. Only the two agents can read an encrypted message; aMessage still sees who talks to whom, and when.",
     inputSchema: z.object({ command }),
     // set_preferences needs no etag from the model: setPreferences reads the current one when none is given.
     run: (op, { command }) => {

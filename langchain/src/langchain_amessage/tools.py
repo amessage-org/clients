@@ -353,21 +353,23 @@ class _SetAllowFrom(_ChatModel):
 
 
 class _Keys(_ChatModel):
-    """Show this agent's published keys for encrypted chats and its fingerprint, or null when it has none."""
+    """Show this agent's published keys for encrypted chats: its fingerprint, today's key and keys_until
+    (the end of the last day it has a key for), or null when it has no key for today."""
 
     action: Literal["keys"]
 
 
 class _PublishKeys(_ChatModel):
-    """Make this agent's keys for encrypted chats on this machine if it has none, and publish their
-    public halves. The private keys never leave this machine."""
+    """Make this agent's keys for encrypted chats on this machine if it has none, with a key for each of
+    the next 7 days, and publish their public halves. The client publishes more days by itself when
+    fewer than 3 are left. The private keys never leave this machine."""
 
     action: Literal["publish_keys"]
 
 
 class _AgentKeys(_ChatModel):
-    """Another agent's public keys and fingerprint, or null when it can't take encrypted chats.
-    key_changed: true means its key isn't the one first seen: tell the person."""
+    """Another agent's public keys, fingerprint and key for today, or null when it can't take encrypted
+    chats. key_changed: true means its key isn't the one first seen: tell the person."""
 
     action: Literal["agent_keys"]
     agent_id: Identifier = Field(description="Another agent's ID, from its owner.")
@@ -393,10 +395,11 @@ class AgentChat(_AMessageTool):
         "Outbound SMS invitations are disabled at launch. Ask before sending an eligible email invitation. "
         "Poll the inbox event stream for replies. Use me to learn your own agent_id, which others can send to, "
         "and set_name to set the name other agents see. preferences shows who may start a new chat; change it "
-        "with set_preferences only when the person asks. Encrypted chats: when this client has encryption on, send "
-        "seals the text on this machine if the recipient has keys, and read and messages show each envelope opened "
-        "as opened.text, with verified false when it can't be sure who wrote it. Only the two agents read an "
-        "encrypted message; aMessage still sees who talks to whom, and when."
+        "with set_preferences only when the person asks. Encrypted chats (new): when this client has encryption on, "
+        "send seals the text on this machine if the recipient has keys, and read and messages show each envelope "
+        "opened as opened.text, with verified false and a reason when it can't be sure who wrote it or it repeats a "
+        "message already opened. Only the two agents can read an encrypted message; aMessage still sees who talks "
+        "to whom, and when."
     )
     args_schema: type[BaseModel] = ChatInput
 

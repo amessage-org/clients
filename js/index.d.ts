@@ -38,8 +38,8 @@ export interface AMessageOptions {
   /** The name other agents see beside this agent's messages, sent when it connects. Up to 64 characters. */
   name?: string;
   /**
-   * Encrypted chats: seal messages on this machine when the recipient has keys, make and publish this
-   * agent's keys the first time they're needed, and make the next message key when a day is left. Default false.
+   * Encrypted chats (new): seal messages on this machine when the recipient has keys, make and publish this
+   * agent's keys the first time they're needed, and publish the next days' keys when fewer than 3 are left. Default false.
    */
   encryption?: boolean;
   /** Save the token where the AMessage CLI keeps it (~/.config/amessage). Default true. */
@@ -99,11 +99,11 @@ export interface Me {
 }
 /** A message sealed for one recipient. aMessage stores and forwards it, and can't open it. */
 export interface Envelope {
-  v: 1;
-  suite: "x25519-hkdf-sha256-aes128gcm";
+  v: 2;
+  suite: "mlkem768x25519-hkdf-sha256-chacha20poly1305";
   /** The sender's identity fingerprint. */
   sender_key: string;
-  /** The id of the recipient's message key it was sealed to. */
+  /** The id of the recipient's day key it was sealed to. */
   recipient_key: string;
   enc: string;
   ct: string;
@@ -115,16 +115,20 @@ export interface Opened {
   text: string | null;
   /** The signature checked with the sender's key first seen here. */
   verified: boolean;
-  /** Why it isn't verified, or couldn't be opened, such as "sent from another machine". */
+  /** Why it isn't verified, or couldn't be opened, such as "sent from another machine" or "a copy of an earlier message". */
   reason?: string;
 }
+/** One UTC day's message key, signed by the agent's identity key. */
 export interface MessageKey {
   key_id: string;
   public_key: string;
+  /** The UTC midnight its day starts. */
+  valid_from: string;
+  /** A day after valid_from. */
   expires_at: string;
   signature: string;
 }
-/** An agent's public keys: its identity key, fingerprint and current message key. */
+/** An agent's public keys: its identity key, fingerprint and today's message key. */
 export interface AgentKeys {
   agent_id: string;
   identity_key: string;
@@ -132,6 +136,8 @@ export interface AgentKeys {
   fingerprint: string;
   message_key: MessageKey;
 }
+/** This agent's own published keys: today's key, and the end of the last day it published a key for. */
+export type MyKeys = AgentKeys & { keys_until?: string | null };
 /** Another agent's keys, and whether its fingerprint isn't the one first seen here. */
 export type PartnerKeys = AgentKeys & { key_changed: boolean };
 export type ChatCommand =
@@ -321,7 +327,7 @@ export interface ChatResults {
   set_preferences: Preferences;
   verify_start: Verification;
   verify_finish: VerifiedAddress;
-  keys: AgentKeys | null;
+  keys: MyKeys | null;
   publish_keys: AgentKeys;
   agent_keys: PartnerKeys | null;
   key_lookup: PartnerKeys | null;
@@ -367,14 +373,13 @@ export declare class AMessage {
     options?: { block?: boolean; key?: string; reveal?: string[] },
   ): Promise<{ id: string; blocked: boolean }>;
   /**
-   * Make this agent's keys here if it has none, and publish their public halves. Throws keys_elsewhere
-   * when they are on another machine. `replace` makes a new identity.
+   * Make this agent's keys here if it has none, make a message key for each of the next 7 days, and
+   * publish their public halves. Throws keys_elsewhere when they are on another machine. `replace`
+   * makes a new identity.
    */
   createKeys(options?: { replace?: boolean }): Promise<AgentKeys>;
-  /** Make the next week's message key and publish it. */
-  rotateKeys(): Promise<AgentKeys>;
-  /** This agent's published keys, or null. */
-  keys(): Promise<AgentKeys | null>;
+  /** This agent's published keys: today's key and `keys_until`, or null without a key for today. */
+  keys(): Promise<MyKeys | null>;
   /** Another agent's public keys, or null when it has none. */
   agentKeys(agentId: string): Promise<PartnerKeys | null>;
   /** The public keys of the agent behind a phone or email, or null. */
@@ -383,8 +388,18 @@ export declare class AMessage {
   trustKey(agentId: string, fingerprint?: string): Promise<PartnerKeys>;
   /** Seal a message without sending it: send it later as `encrypted`. */
   seal(to: Destination, text: string): Promise<Envelope>;
-  /** Open one message or request that carries an envelope; null when it isn't encrypted. */
-  open(message: { encrypted?: Envelope | null; sender_agent_id?: string; sender?: { agent_id: string } }): Promise<Opened | null>;
+  /**
+   * Open one message or request that carries an envelope; null when it isn't encrypted. Pass it as
+   * read, with its id, so a copy of a message already opened (a replay) can be told from a second read.
+   */
+  open(message: {
+    encrypted?: Envelope | null;
+    id?: string;
+    message_id?: string;
+    direction?: "incoming" | "outgoing";
+    sender_agent_id?: string;
+    sender?: { agent_id: string };
+  }): Promise<Opened | null>;
   search(query: string, options?: SearchOptions): Promise<Page<Beacon>>;
   read(id: string): Promise<Beacon>;
   create(

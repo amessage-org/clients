@@ -1,10 +1,17 @@
-"""aMessage's encrypted chats, version 1, on `cryptography`: the same as the JavaScript SDK's
+"""aMessage's encrypted chats, version 2 (new), on `cryptography`: the same as the JavaScript SDK's
 e2e.js and the reference (docs/design/encrypted-chats.md in the aMessage repo says it in words).
 
-An agent has an Ed25519 identity key and a weekly X25519 message key the identity key signs. A
-message is HPKE-sealed (RFC 9180) to the recipient's message key and signed by the sender.
-Private keys stay on this machine: nothing here sends anything anywhere. Raw keys are 32 bytes.
+An agent has an Ed25519 identity key and a message key for each UTC day, which the identity key
+signs. A message is sealed to the recipient's key for the day, so only the two agents can read it,
+and signed by the sender. Private keys stay on this machine: nothing here sends anything anywhere.
+An identity key is 32 raw bytes; a message key's private half is a 32-byte seed, its public half
+1,216 bytes.
 """
+
+# The seal is HPKE (RFC 9180), base mode, single-shot, with one suite from draft-ietf-hpke-pq: the
+# post-quantum hybrid KEM MLKEM768-X25519 (X-Wing), HKDF-SHA256 and ChaCha20-Poly1305 (kem 0x647a,
+# kdf 0x0001, aead 0x0003). The draft's appendix A.5 vector checks this code (tests/test_e2e.py).
+# ML-KEM-768 needs cryptography 48 or later.
 
 from __future__ import annotations
 
@@ -19,28 +26,34 @@ from typing import Optional
 from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.mlkem import MLKEM768PrivateKey, MLKEM768PublicKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 
-SUITE = "x25519-hkdf-sha256-aes128gcm"
-VERSION = 1
-INFO = b"amessage e2e v1"
-# The most an envelope may weigh, as JSON.
-MAX_ENVELOPE_BYTES = 12288
+SUITE = "mlkem768x25519-hkdf-sha256-chacha20poly1305"
+VERSION = 2
+INFO = b"amessage e2e v2"
+# The most an envelope may weigh, as JSON: room for 2,000 characters in any script.
+MAX_ENVELOPE_BYTES = 14336
 # The most characters a message's text may have.
 MAX_TEXT = 2000
-# A message key lives a week; a send to one that ended a day ago still counts.
-MESSAGE_KEY_DAYS = 7
 DAY = timedelta(days=1)
-# How long old private message keys (and copies of sent messages) are kept.
+# Each message key covers one UTC day; clients publish this many days at a time.
+DAYS_AHEAD = 7
+# Clients publish again when fewer than this many days of keys are left.
+MIN_DAYS_LEFT = 3
+# How long private message keys (and copies of sent messages, and opened commitments) are kept.
 KEEP_DAYS = 180
+# A message key's private seed, its public key and an encapsulated key, in bytes.
+SEED_BYTES = 32
+PUBLIC_BYTES = 1216
+ENC_BYTES = 1120
 
-# HPKE (RFC 9180), base mode, single-shot, one suite: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256 and
-# AES-128-GCM (kem 0x0020, kdf 0x0001, aead 0x0001), the suite of RFC 9180's Appendix A.1.
-
-_KEM_ID, _KDF_ID, _AEAD_ID = 0x0020, 0x0001, 0x0001
-_NH, _NK, _NN, _NT = 32, 16, 12, 16
-_KEM_SUITE = b"KEM" + _KEM_ID.to_bytes(2, "big")
+_KEM_ID, _KDF_ID, _AEAD_ID = 0x647A, 0x0001, 0x0003
+_NH, _NK, _NN, _NT = 32, 32, 12, 16
+_MLKEM_PUBLIC, _MLKEM_CT = 1184, 1088
+# X-Wing's fixed label, "\.//^\".
+_XWING_LABEL = bytes.fromhex("5c2e2f2f5e5c")
 _HPKE_SUITE = b"HPKE" + _KEM_ID.to_bytes(2, "big") + _KDF_ID.to_bytes(2, "big") + _AEAD_ID.to_bytes(2, "big")
 _V1 = b"HPKE-v1"
 _RAW = {"encoding": serialization.Encoding.Raw, "format": serialization.PublicFormat.Raw}
@@ -59,85 +72,108 @@ def _expand(prk: bytes, info: bytes, length: int) -> bytes:
     return out[:length]
 
 
-def _labeled_extract(suite: bytes, salt: bytes, label: str, ikm: bytes) -> bytes:
-    return _extract(salt, _V1 + suite + label.encode() + ikm)
+def _labeled_extract(salt: bytes, label: str, ikm: bytes) -> bytes:
+    return _extract(salt, _V1 + _HPKE_SUITE + label.encode() + ikm)
 
 
-def _labeled_expand(suite: bytes, prk: bytes, label: str, info: bytes, length: int) -> bytes:
-    return _expand(prk, length.to_bytes(2, "big") + _V1 + suite + label.encode() + info, length)
+def _labeled_expand(prk: bytes, label: str, info: bytes, length: int) -> bytes:
+    return _expand(prk, length.to_bytes(2, "big") + _V1 + _HPKE_SUITE + label.encode() + info, length)
 
 
-def generate_x25519() -> tuple[bytes, bytes]:
-    """A fresh X25519 key pair, raw: (private, public)."""
-    key = X25519PrivateKey.generate()
-    private = key.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
-    return private, key.public_key().public_bytes(**_RAW)
-
-
-def x25519_public_of(private: bytes) -> bytes:
-    """The raw X25519 public key of a raw private key."""
+def _x25519_public_of(private: bytes) -> bytes:
     return X25519PrivateKey.from_private_bytes(private).public_key().public_bytes(**_RAW)
 
 
-def derive_x25519(ikm: bytes) -> tuple[bytes, bytes]:
-    """RFC 9180 DeriveKeyPair for X25519, the test vectors' way to fix a key: (private, public)."""
-    prk = _labeled_extract(_KEM_SUITE, b"", "dkp_prk", ikm)
-    sk = _labeled_expand(_KEM_SUITE, prk, "sk", b"", 32)
-    return sk, x25519_public_of(sk)
+def _expand_seed(seed: bytes) -> tuple[MLKEM768PrivateKey, bytes, bytes, bytes]:
+    # X-Wing's expandDecapsulationKey: SHAKE256 turns the 32-byte seed into the ML-KEM-768 seed
+    # (d ‖ z, FIPS 203) and the X25519 private key.
+    if len(seed) != SEED_BYTES:
+        raise ValueError("a message key's private seed is 32 bytes")
+    expanded = hashlib.shake_256(seed).digest(96)
+    mlkem = MLKEM768PrivateKey.from_seed_bytes(expanded[:64])
+    sk_x = expanded[64:]
+    return mlkem, sk_x, mlkem.public_key().public_bytes_raw(), _x25519_public_of(sk_x)
 
 
-def _dh(private: bytes, public: bytes) -> bytes:
-    return X25519PrivateKey.from_private_bytes(private).exchange(X25519PublicKey.from_public_bytes(public))
+def _combine(ss_m: bytes, ss_x: bytes, ct_x: bytes, pk_x: bytes) -> bytes:
+    # X-Wing's combiner.
+    return hashlib.sha3_256(ss_m + ss_x + ct_x + pk_x + _XWING_LABEL).digest()
 
 
-def _shared_secret(dh: bytes, enc: bytes, pk_r: bytes) -> bytes:
-    prk = _labeled_extract(_KEM_SUITE, b"", "eae_prk", dh)
-    return _labeled_expand(_KEM_SUITE, prk, "shared_secret", enc + pk_r, _NH)
+def message_public_of(seed: bytes) -> bytes:
+    """The 1,216-byte public key of a message key's 32-byte private seed."""
+    _, _, pk_m, pk_x = _expand_seed(seed)
+    return pk_m + pk_x
+
+
+def generate_message_key_pair() -> tuple[bytes, bytes]:
+    """A fresh message key pair: (32-byte private seed, 1,216-byte public key)."""
+    seed = os.urandom(SEED_BYTES)
+    return seed, message_public_of(seed)
+
+
+def _encap(pk: bytes) -> tuple[bytes, bytes]:
+    if len(pk) != PUBLIC_BYTES:
+        raise ValueError("a message public key is 1,216 bytes")
+    pk_m, pk_x = pk[:_MLKEM_PUBLIC], pk[_MLKEM_PUBLIC:]
+    ephemeral = X25519PrivateKey.generate()
+    ct_x = ephemeral.public_key().public_bytes(**_RAW)
+    ss_x = ephemeral.exchange(X25519PublicKey.from_public_bytes(pk_x))
+    ss_m, ct_m = MLKEM768PublicKey.from_public_bytes(pk_m).encapsulate()
+    return _combine(ss_m, ss_x, ct_x, pk_x), ct_m + ct_x
+
+
+def _decap(seed: bytes, enc: bytes) -> bytes:
+    if len(enc) != ENC_BYTES:
+        raise ValueError("not an HPKE message")
+    mlkem, sk_x, _, pk_x = _expand_seed(seed)
+    ct_x = enc[_MLKEM_CT:]
+    ss_m = mlkem.decapsulate(enc[:_MLKEM_CT])
+    ss_x = X25519PrivateKey.from_private_bytes(sk_x).exchange(X25519PublicKey.from_public_bytes(ct_x))
+    return _combine(ss_m, ss_x, ct_x, pk_x)
 
 
 def _key_schedule(shared: bytes, info: bytes) -> tuple[bytes, bytes]:
-    psk_id_hash = _labeled_extract(_HPKE_SUITE, b"", "psk_id_hash", b"")
-    info_hash = _labeled_extract(_HPKE_SUITE, b"", "info_hash", info)
-    context = b"\x00" + psk_id_hash + info_hash
-    secret = _labeled_extract(_HPKE_SUITE, shared, "secret", b"")
-    return (
-        _labeled_expand(_HPKE_SUITE, secret, "key", context, _NK),
-        _labeled_expand(_HPKE_SUITE, secret, "base_nonce", context, _NN),
-    )
+    context = b"\x00" + _labeled_extract(b"", "psk_id_hash", b"") + _labeled_extract(b"", "info_hash", info)
+    secret = _labeled_extract(shared, "secret", b"")
+    return _labeled_expand(secret, "key", context, _NK), _labeled_expand(secret, "base_nonce", context, _NN)
 
 
-def hpke_seal(
-    recipient_public: bytes,
-    info: bytes,
-    aad: bytes,
-    plaintext: bytes,
-    ephemeral: Optional[tuple[bytes, bytes]] = None,
-) -> tuple[bytes, bytes]:
-    """Seals plaintext to the recipient's raw X25519 public key: (enc, ciphertext with its tag).
-    `ephemeral` fixes the ephemeral key, for test vectors only."""
-    private, enc = ephemeral or generate_x25519()
-    shared = _shared_secret(_dh(private, recipient_public), enc, recipient_public)
-    key, nonce = _key_schedule(shared, info)
-    return enc, AESGCM(key).encrypt(nonce, plaintext, aad)
-
-
-def hpke_open(recipient_private: bytes, enc: bytes, info: bytes, aad: bytes, ct: bytes) -> bytes:
-    """Opens what hpke_seal made, with the recipient's raw private key; raises if anything was changed."""
-    if len(enc) != 32 or len(ct) < _NT:
+def _aead_open(key: bytes, nonce: bytes, aad: bytes, ct: bytes) -> bytes:
+    if len(ct) < _NT:
         raise ValueError("not an HPKE message")
-    shared = _shared_secret(_dh(recipient_private, enc), enc, x25519_public_of(recipient_private))
-    key, nonce = _key_schedule(shared, info)
     try:
-        return AESGCM(key).decrypt(nonce, ct, aad)
+        return ChaCha20Poly1305(key).decrypt(nonce, ct, aad)
     except InvalidTag:
         raise ValueError("the sealed message was changed") from None
 
 
-def inspect(enc: bytes, recipient_private: bytes, info: bytes) -> dict:
-    """For the RFC vectors: the shared secret and key schedule a seal used."""
-    shared = _shared_secret(_dh(recipient_private, enc), enc, x25519_public_of(recipient_private))
+def hpke_seal(recipient_public: bytes, info: bytes, aad: bytes, plaintext: bytes) -> tuple[bytes, bytes]:
+    """Seals plaintext to the recipient's 1,216-byte message public key: (the 1,120-byte
+    encapsulated key, the ciphertext with its tag)."""
+    shared, enc = _encap(recipient_public)
+    key, nonce = _key_schedule(shared, info)
+    return enc, ChaCha20Poly1305(key).encrypt(nonce, plaintext, aad)
+
+
+def hpke_open(seed: bytes, enc: bytes, info: bytes, aad: bytes, ct: bytes) -> bytes:
+    """Opens what hpke_seal made, with the recipient's 32-byte private seed; raises ValueError if
+    anything was changed."""
+    key, nonce = _key_schedule(_decap(seed, enc), info)
+    return _aead_open(key, nonce, aad, ct)
+
+
+def inspect(seed: bytes, enc: bytes, info: bytes) -> dict:
+    """For the draft's vector: the shared secret and key schedule an encapsulated key gives."""
+    shared = _decap(seed, enc)
     key, nonce = _key_schedule(shared, info)
     return {"shared": shared, "key": key, "nonce": nonce}
+
+
+def open_at(seed: bytes, enc: bytes, info: bytes, aad: bytes, ct: bytes, nonce: bytes) -> bytes:
+    """For the draft's vector: open with an explicit nonce (its later sequence numbers)."""
+    key, _ = _key_schedule(_decap(seed, enc), info)
+    return _aead_open(key, nonce, aad, ct)
 
 
 # The envelope.
@@ -158,7 +194,7 @@ def fingerprint(identity_public: bytes) -> str:
 
 
 def key_id(message_public: bytes) -> str:
-    """A message key's id: the first 32 hex characters of SHA-256 of the raw public key."""
+    """A message key's id: the first 32 hex characters of SHA-256 of its public key."""
     return hashlib.sha256(message_public).hexdigest()[:32]
 
 
@@ -189,21 +225,21 @@ def verify_with(identity_public: bytes, text: str, signature: str) -> bool:
         return False
 
 
-def message_key_statement(message_public: str, expires_at: str) -> str:
-    """What an identity key signs to vouch for a message key."""
-    return f"amessage e2e v1 message key\n{message_public}\n{expires_at}"
+def message_key_statement(message_public: str, valid_from: str, expires_at: str) -> str:
+    """What an identity key signs to vouch for one day's message key."""
+    return f"amessage e2e v2 message key\n{SUITE}\n{message_public}\n{valid_from}\n{expires_at}"
 
 
 def envelope_statement(e: dict) -> str:
     """What a sender signs for each envelope."""
     return "\n".join(
-        ["amessage e2e v1 envelope", e["suite"], e["sender_key"], e["recipient_key"], e["enc"], e["ct"], e["commitment"]]
+        ["amessage e2e v2 envelope", e["suite"], e["sender_key"], e["recipient_key"], e["enc"], e["ct"], e["commitment"]]
     )
 
 
 def associated_data(sender_key: str, recipient_key: str) -> bytes:
     """HPKE's associated data: binds the sealed bytes to who sent them and which key opens them."""
-    return f"amessage e2e v1\n{sender_key}\n{recipient_key}".encode("utf-8")
+    return f"amessage e2e v2\n{sender_key}\n{recipient_key}".encode("utf-8")
 
 
 def commitment(franking_key: bytes, text: str) -> str:
@@ -221,33 +257,66 @@ def parse_time(text: str) -> datetime:
     return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 
-def new_message_key(identity_private: bytes, now: Optional[datetime] = None) -> tuple[bytes, dict]:
-    """A fresh week's message key, signed by the identity key: (raw private key, what to publish)."""
-    private, public = generate_x25519()
-    expires_at = iso((now or datetime.now(timezone.utc)) + timedelta(days=MESSAGE_KEY_DAYS))
-    public_key = b64(public)
-    return private, {
-        "key_id": key_id(public),
+def day_start(at: datetime) -> datetime:
+    """The UTC midnight that starts the day `at` falls in."""
+    at = at.astimezone(timezone.utc)
+    return datetime(at.year, at.month, at.day, tzinfo=timezone.utc)
+
+
+def message_key_for(identity_private: bytes, seed: bytes, day: datetime) -> tuple[bytes, dict]:
+    """One day's message key from a known private seed, signed by the identity key: (the seed,
+    what to publish). `day` is any moment of that UTC day."""
+    public_key = b64(message_public_of(seed))
+    start = day_start(day)
+    valid_from, expires_at = iso(start), iso(start + DAY)
+    return seed, {
+        "key_id": key_id(unb64(public_key)),
         "public_key": public_key,
+        "valid_from": valid_from,
         "expires_at": expires_at,
-        "signature": sign_with(identity_private, message_key_statement(public_key, expires_at)),
+        "signature": sign_with(identity_private, message_key_statement(public_key, valid_from, expires_at)),
     }
+
+
+def new_message_keys(identity_private: bytes, start: Optional[datetime] = None, days: int = DAYS_AHEAD) -> list[tuple[bytes, dict]]:
+    """Fresh message keys for `days` days from the day `start` falls in (today by default), each
+    signed by the identity key: a list of (private seed, what to publish)."""
+    first = day_start(start or datetime.now(timezone.utc))
+    return [message_key_for(identity_private, os.urandom(SEED_BYTES), first + i * DAY) for i in range(days)]
+
+
+def covers_one_day(key: dict) -> bool:
+    """Whether a message key covers exactly one UTC day, written as the API writes it."""
+    try:
+        valid_from, expires_at = key["valid_from"], key["expires_at"]
+        if not isinstance(valid_from, str) or not isinstance(expires_at, str):
+            return False
+        start, end = parse_time(valid_from), parse_time(expires_at)
+        return iso(start) == valid_from and iso(end) == expires_at and day_start(start) == start and end - start == DAY
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return False
+
+
+def check_message_key(identity_public: bytes, key: dict) -> bool:
+    """Whether one day's message key hangs together and the identity key signed it."""
+    try:
+        public = unb64(key["public_key"])
+        return (
+            len(public) == PUBLIC_BYTES
+            and key_id(public) == key["key_id"]
+            and covers_one_day(key)
+            and verify_with(identity_public, message_key_statement(key["public_key"], key["valid_from"], key["expires_at"]), key["signature"])
+        )
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return False
 
 
 def check_keys(keys: dict) -> bool:
     """Whether another agent's published keys hang together: the fingerprint is its identity key's,
-    the key id is its message key's, and the identity key signed the message key."""
+    and its day's message key has the right size and id, covers one UTC day, and is signed by it."""
     try:
         identity = unb64(keys["identity_key"])
-        key = keys["message_key"]
-        public = unb64(key["public_key"])
-        return (
-            len(identity) == 32
-            and fingerprint(identity) == keys["fingerprint"]
-            and len(public) == 32
-            and key_id(public) == key["key_id"]
-            and verify_with(identity, message_key_statement(key["public_key"], key["expires_at"]), key["signature"])
-        )
+        return len(identity) == 32 and fingerprint(identity) == keys["fingerprint"] and check_message_key(identity, keys["message_key"])
     except (KeyError, TypeError, ValueError, AttributeError):
         return False
 
@@ -265,11 +334,11 @@ def seal_message(
     identity_public: bytes,
     recipient_key: dict,
     now: Optional[datetime] = None,
-    ephemeral: Optional[tuple[bytes, bytes]] = None,
     franking_key: Optional[bytes] = None,
 ) -> dict:
     """Seals one message from agent `sender` to agent `recipient` on the sender's own machine,
-    never aMessage's. `now`, `ephemeral` and `franking_key` fix the random parts, for test vectors only."""
+    never aMessage's. `now` and `franking_key` fix those parts, for tests only; the seal itself
+    always takes fresh randomness."""
     if not isinstance(text, str) or not text:
         raise TypeError("A message needs text.")
     if len(text) > MAX_TEXT:
@@ -288,7 +357,6 @@ def seal_message(
         INFO,
         associated_data(sender_key, recipient_key["key_id"]),
         _payload_json(payload),
-        ephemeral,
     )
     unsigned = {
         "suite": SUITE,
@@ -305,9 +373,10 @@ def seal_message(
 
 
 def open_message(envelope: dict, message_private: bytes, sender_identity_public: bytes, me: str, sender: str) -> dict:
-    """Opens one envelope on the recipient's machine and checks everything a recipient can: the
-    seal, the sender's signature, who it says it's from and to, and the report commitment. Raises
-    ValueError when any check fails, so the words are never shown."""
+    """Opens one envelope on the recipient's machine and checks everything a recipient can from the
+    envelope alone: the seal, the sender's signature, who it says it's from and to, and the report
+    commitment. Raises ValueError when any check fails, so the words are never shown. (Dropping
+    replays needs the commitments opened before; the AMessage client keeps them in seen.json.)"""
     e = envelope
     if not is_envelope(e):
         raise ValueError("unknown envelope version")
@@ -329,8 +398,13 @@ def open_message(envelope: dict, message_private: bytes, sender_identity_public:
     return payload
 
 
-def _b64url(value: object) -> bool:
-    return isinstance(value, str) and bool(value) and all(c.isascii() and (c.isalnum() or c in "-_") for c in value)
+def _b64url(value: object, length: Optional[int] = None) -> bool:
+    if not isinstance(value, str) or not value or not all(c.isascii() and (c.isalnum() or c in "-_") for c in value):
+        return False
+    try:
+        return length is None or len(unb64(value)) == length
+    except ValueError:
+        return False
 
 
 def _hex(value: object, length: int) -> bool:
@@ -348,12 +422,10 @@ def is_envelope(value: object) -> bool:
         and e.get("suite") == SUITE
         and _hex(e.get("sender_key"), 64)
         and _hex(e.get("recipient_key"), 32)
-        and _b64url(e.get("enc"))
-        and len(unb64(e["enc"])) == 32
+        and _b64url(e.get("enc"), ENC_BYTES)
         and _b64url(e.get("ct"))
-        and _b64url(e.get("commitment"))
-        and len(unb64(e["commitment"])) == 32
-        and _b64url(e.get("sig"))
+        and _b64url(e.get("commitment"), 32)
+        and _b64url(e.get("sig"), 64)
     )
 
 

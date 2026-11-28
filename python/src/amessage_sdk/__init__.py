@@ -30,7 +30,7 @@ from . import e2e
 
 __all__ = ["AMessage", "AMessageError", "EncryptionError", "search", "read", "UNSET", "VERSION", "DEFAULT_API", "e2e"]
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 DEFAULT_API = "https://api.amessage.sh"
 OUTCOMES = ("accepted", "booked", "hired", "declined", "spam")
 
@@ -153,7 +153,7 @@ def _write_all(path: Path, data: dict) -> None:
 
 
 def _read_strict(path: Path) -> dict:
-    """keys.json or sent.json: empty when missing, but never read past a broken file, which would
+    """keys.json, sent.json or seen.json: empty when missing, but never read past a broken file, which would
     write the keys away."""
     try:
         text = path.read_text("utf-8")
@@ -175,31 +175,65 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _current_key(entry: dict) -> dict | None:
-    """The message key to publish and seal to: the one that lasts longest."""
-    keys = entry.get("message_keys") or []
-    return max(keys, key=lambda k: e2e.parse_time(k["expires_at"]), default=None)
+# The most day keys one PUT /v1/me/keys takes.
+_MAX_PUBLISH = 14
+# How an envelope reads when its commitment was already opened under another message id.
+_REPLAY = "a copy of a message already opened"
+_PUBLIC_FIELDS = ("key_id", "public_key", "valid_from", "expires_at", "signature")
 
 
-def _lasts(key: dict | None, now: datetime) -> bool:
-    """Whether a message key has more than a day left."""
-    return bool(key) and e2e.parse_time(key["expires_at"]) - now > e2e.DAY
+def _is_day_key(key: object) -> bool:
+    """A message key of version 2: it has the day it covers. (Version 1 keys have no valid_from.)"""
+    return isinstance(key, dict) and bool(key.get("valid_from"))
 
 
-def _add_message_key(entry: dict, now: datetime | None = None) -> None:
-    """Adds a fresh message key to an agent's keys.json entry, and drops ones that ended 180 days ago."""
+def _own_day_keys(entry: dict) -> list[dict]:
+    """An agent's day keys in keys.json that its current identity key signed (after a new identity,
+    the old one's keys stay only to open what was sealed to them)."""
+    identity = e2e.unb64(entry["identity"]["public"])
+    return [
+        k
+        for k in entry.get("message_keys") or []
+        if _is_day_key(k)
+        and e2e.verify_with(identity, e2e.message_key_statement(k["public_key"], k["valid_from"], k["expires_at"]), k["signature"])
+    ]
+
+
+def _running_out(entry: dict, now: datetime) -> bool:
+    """Whether fewer than 3 days of keys are left, so it's time to publish more."""
+    ends = [e2e.parse_time(k["expires_at"]) for k in _own_day_keys(entry)]
+    return not ends or max(ends) - now < e2e.MIN_DAYS_LEFT * e2e.DAY
+
+
+def _add_day_keys(entry: dict, now: datetime | None = None) -> None:
+    """Makes the day keys an agent's keys.json entry lacks for today and the 6 days after, and drops
+    private keys whose day ended 180 days ago."""
     now = now or _now()
-    private, public = e2e.new_message_key(e2e.unb64(entry["identity"]["private"]), now)
-    entry["message_keys"] = [k for k in entry.get("message_keys") or [] if e2e.parse_time(k["expires_at"]) + _KEEP > now]
-    entry["message_keys"].append(
-        {
-            "key_id": public["key_id"],
-            "private": e2e.b64(private),
-            "public_key": public["public_key"],
-            "expires_at": public["expires_at"],
-            "signature": public["signature"],
-        }
-    )
+    identity_private = e2e.unb64(entry["identity"]["private"])
+    entry["message_keys"] = [k for k in entry.get("message_keys") or [] if _is_day_key(k) and e2e.parse_time(k["expires_at"]) + _KEEP > now]
+    have = {k["valid_from"] for k in _own_day_keys(entry)}
+    today = e2e.day_start(now)
+    for i in range(e2e.DAYS_AHEAD):
+        day = today + i * e2e.DAY
+        if e2e.iso(day) in have:
+            continue
+        seed, public = e2e.message_key_for(identity_private, os.urandom(e2e.SEED_BYTES), day)
+        entry["message_keys"].append({"key_id": public["key_id"], "private": e2e.b64(seed), **{f: public[f] for f in _PUBLIC_FIELDS[1:]}})
+    entry["message_keys"].sort(key=lambda k: e2e.parse_time(k["valid_from"]))
+
+
+def _sealed(item: object) -> bool:
+    """Whether a message or request carries an envelope."""
+    return isinstance(item, dict) and isinstance(item.get("encrypted"), dict)
+
+
+class _Reading:
+    """One read's worth of opening: the senders' keys fetched so far, and what was opened, for the
+    replay check."""
+
+    def __init__(self) -> None:
+        self.senders: dict = {}
+        self.opened: list[dict] = []
 
 
 def _missing(error: Exception) -> bool:
@@ -275,6 +309,8 @@ class AMessage:
         self.keys_file = self.file.parent / "keys.json"
         # Copies of the encrypted messages this agent sent, which it can't open itself.
         self.sent_file = self.file.parent / "sent.json"
+        # The commitments of the envelopes this agent opened, by message id, to drop replays.
+        self.seen_file = self.file.parent / "seen.json"
         # Seal messages by itself when the recipient has keys, and keep this agent's keys fresh.
         self.encryption = encryption is True
         self._agent_id: str | None = None
@@ -532,13 +568,17 @@ class AMessage:
         """Report a conversation. `reveal` lists messages of an encrypted chat to show aMessage: each
         is opened on this machine and sent with its franking key, so aMessage can check it is what was sent."""
         body: dict = {"reason": reason, "block": block}
-        shown = []
-        cache: dict = {}
+        reading = _Reading()
+        opened = []
         for message_id in reveal or ():
             message = self.call("GET", f"/v1/messages/{_quote(message_id)}")
-            if not (message or {}).get("encrypted"):
+            if not _sealed(message):
                 continue  # aMessage can read a plain message already.
-            payload = self._unseal(message, cache)[1]
+            opened.append((message_id, self._unseal(message, reading)))
+        self._drop_replays(reading)
+        shown = []
+        for message_id, result in opened:
+            payload = result.get("payload")
             if payload is None:
                 raise EncryptionError("cant_open", f"Message {message_id} couldn't be opened on this machine, so it can't be revealed.")
             shown.append({"message_id": message_id, "text": payload["text"], "franking_key": payload["franking_key"]})
@@ -578,15 +618,28 @@ class AMessage:
             return result
 
     def _entry(self) -> tuple[str, dict | None]:
-        """This agent's keys.json entry, read fresh, or None."""
+        """This agent's keys.json entry, read fresh, or None. The first time, it drops message keys
+        of version 1 (those with no valid_from), which nothing can use now; the identity key and
+        pins stay."""
         me = self._me()
         entry = (_read_strict(self.keys_file).get(self.api) or {}).get(me)
+        if isinstance(entry, dict) and isinstance(entry.get("message_keys"), list) and not all(map(_is_day_key, entry["message_keys"])):
+
+            def change(everything: dict):
+                current = (everything.get(self.api) or {}).get(me)
+                if isinstance(current, dict) and isinstance(current.get("message_keys"), list):
+                    current["message_keys"] = [k for k in current["message_keys"] if _is_day_key(k)]
+                return current
+
+            entry = self._update_keys(change)
         return me, entry if isinstance(entry, dict) and entry.get("identity") else None
 
     def _publish(self, entry: dict) -> dict:
-        k = _current_key(entry)
-        message_key = {field: k[field] for field in ("key_id", "public_key", "expires_at", "signature")}
-        return self.call("PUT", "/v1/me/keys", body={"identity_key": entry["identity"]["public"], "message_key": message_key})
+        """Publishes the identity key and the day keys it signed from today on: 7 days, as made."""
+        now = _now()
+        days = [k for k in _own_day_keys(entry) if e2e.parse_time(k["expires_at"]) > now][:_MAX_PUBLISH]
+        message_keys = [{field: k[field] for field in _PUBLIC_FIELDS} for k in days]
+        return self.call("PUT", "/v1/me/keys", body={"identity_key": entry["identity"]["public"], "message_keys": message_keys})
 
     def _mine_on_server(self, entry: dict | None) -> None:
         """Refuse to publish over an identity another machine holds: GET /v1/me says the agent's
@@ -606,10 +659,11 @@ class AMessage:
         )
 
     def create_keys(self, replace: bool = False) -> dict:
-        """Make this agent's keys for encrypted chats on this machine, if it has none, and publish
-        their public halves. The private keys stay in keys.json. Raises EncryptionError keys_elsewhere
-        when the agent's keys are on another machine. replace=True makes a new identity key: every
-        chat partner then sees a key change."""
+        """Make this agent's keys for encrypted chats on this machine, if it has none, make a message
+        key for each of the next 7 days (UTC) it lacks one for, and publish their public halves. The
+        private keys stay in keys.json, each for 180 days. Raises EncryptionError keys_elsewhere when
+        the agent's keys are on another machine. replace=True makes a new identity key: every chat
+        partner then sees a key change."""
         me = self._me()
         if not replace:
             self._mine_on_server(self._entry()[1])
@@ -619,46 +673,25 @@ class AMessage:
             old = agents.get(me) or {}
             if not old.get("identity") or replace:
                 private, public = e2e.generate_identity()
-                # Old message keys stay, to open what was already sealed to them.
+                # Old day keys stay, to open what was already sealed to them.
                 agents[me] = {
                     "identity": {"private": e2e.b64(private), "public": e2e.b64(public)},
                     "message_keys": old.get("message_keys") or [],
                     "pins": old.get("pins") or {},
                 }
-                _add_message_key(agents[me])
-            elif not _lasts(_current_key(old), _now()):
-                _add_message_key(old)
+            _add_day_keys(agents[me])
             return agents[me]
 
         return self._publish(self._update_keys(change))
 
-    def rotate_keys(self) -> dict:
-        """Make the next week's message key and publish it. Old private message keys stay for 180 days."""
-        me, local = self._entry()
-        if local is None:
-            return self.create_keys()
-        self._mine_on_server(local)
-
-        def change(everything: dict):
-            entry = (everything.get(self.api) or {}).get(me)
-            if not entry or not entry.get("identity"):
-                return None
-            _add_message_key(entry)
-            return entry
-
-        entry = self._update_keys(change)
-        return self._publish(entry) if entry else self.create_keys()
-
     def _ready(self) -> None:
-        """Keys made if missing, and the next message key when the current one has less than a day left."""
+        """Keys made if missing, and the next days' keys published when fewer than 3 days are left."""
         entry = self._entry()[1]
-        if entry is None:
+        if entry is None or _running_out(entry, _now()):
             self.create_keys()
-        elif not _lasts(_current_key(entry), _now()):
-            self.rotate_keys()
 
     def keys(self) -> dict | None:
-        """This agent's published keys, as aMessage has them, or None."""
+        """This agent's published keys, as aMessage has them (today's key and keys_until), or None."""
         try:
             return self.call("GET", "/v1/me/keys")
         except AMessageError as error:
@@ -818,32 +851,32 @@ class AMessage:
         """Adds `opened` to each message or request that carries an envelope."""
         if not isinstance(value, dict):
             return value
-        cache: dict = {}
-        if isinstance(value.get("data"), list):
-            return {**value, "data": [self._open_one(item, cache) for item in value["data"]]}
-        return self._open_one(value, cache)
+        items = value["data"] if isinstance(value.get("data"), list) else [value]
+        reading = _Reading()
+        results = [self._unseal(item, reading) if _sealed(item) else None for item in items]
+        self._drop_replays(reading)
+        out = [{**item, "opened": result["opened"]} if result else item for item, result in zip(items, results)]
+        return {**value, "data": out} if isinstance(value.get("data"), list) else out[0]
 
-    def _open_one(self, item, cache: dict):
-        if not isinstance(item, dict) or not isinstance(item.get("encrypted"), dict):
-            return item
-        return {**item, "opened": self._unseal(item, cache)[0]}
-
-    def _unseal(self, item: dict, cache: dict) -> tuple[dict, dict | None]:
-        """Opens one message's envelope on this machine, or says why it couldn't: (opened, payload)."""
+    def _unseal(self, item: dict, reading: _Reading) -> dict:
+        """Opens one message's envelope on this machine, or says why it couldn't: {"opened", "payload"}.
+        What it opened waits in `reading` for _drop_replays, which turns a replay into one that
+        couldn't be opened."""
+        cache = reading.senders
         envelope = item["encrypted"]
         me = self._me()
         sender = item.get("sender_agent_id") or (item.get("sender") or {}).get("agent_id")
 
-        def fail(reason: str):
-            return {"text": None, "verified": False, "reason": reason}, None
+        def fail(reason: str) -> dict:
+            return {"opened": {"text": None, "verified": False, "reason": reason}, "payload": None}
 
         if sender == me:
             copy = ((_read_strict(self.sent_file).get(self.api) or {}).get(me) or {}).get(item.get("message_id") or item.get("id"))
-            return ({"text": copy["text"], "verified": True}, None) if copy else fail("sent from another machine")
+            return {"opened": {"text": copy["text"], "verified": True}, "payload": None} if copy else fail("sent from another machine")
         if not e2e.is_envelope(envelope):
             return fail("not an envelope this version can open")
         entry = self._entry()[1] or {}
-        key = next((k for k in entry.get("message_keys") or [] if k.get("key_id") == envelope["recipient_key"]), None)
+        key = next((k for k in entry.get("message_keys") or [] if _is_day_key(k) and k.get("key_id") == envelope["recipient_key"]), None)
         if key is None:
             return fail("sealed to a key this machine doesn't have")
         if not sender:
@@ -863,15 +896,67 @@ class AMessage:
         except ValueError as error:
             return fail(f"it failed a check: {error}")
         if self._pin(sender, keys["fingerprint"])[0] == "changed":
-            return {"text": payload["text"], "verified": False, "reason": "their key changed since your first chat"}, payload
-        return {"text": payload["text"], "verified": True}, payload
+            opened = {"text": payload["text"], "verified": False, "reason": "their key changed since your first chat"}
+        else:
+            opened = {"text": payload["text"], "verified": True}
+        result = {"opened": opened, "payload": payload}
+        # A message has its id. A request names its message once that is posted or it's our own; an
+        # incoming request still waiting has none, and its envelope can't have been opened as a message yet.
+        request = isinstance(item.get("direction"), str)
+        message_id = item.get("message_id") or (None if request else item.get("id"))
+        if message_id or request:
+            at = item.get("posted_at") or item.get("created_at") or ""
+            reading.opened.append({"commitment": envelope["commitment"], "message_id": message_id, "at": at, "result": result})
+        return result
+
+    def _drop_replays(self, reading: _Reading) -> None:
+        """Drops replays: an envelope whose commitment this agent already opened under another
+        message id shows as one that couldn't be opened. Reading the same message again is no
+        replay. seen.json (0600, shared with the CLI) keeps each commitment's first message id for
+        180 days. A waiting request (no message id yet) is only checked: any earlier opening makes it
+        a replay."""
+        if not reading.opened:
+            return
+        me = self._me()
+        # Oldest first, so within one page the first of two copies is the one that reads.
+        order = sorted(reading.opened, key=lambda o: str(o["at"]))
+        with self._keys_lock:
+            everything = _read_strict(self.seen_file)
+            mine = everything.setdefault(self.api, {}).setdefault(me, {})
+            now = _now()
+            changed = False
+            for o in order:
+                seen = mine.get(o["commitment"])
+                seen_id = seen.get("message_id") if isinstance(seen, dict) else None
+                if isinstance(seen_id, str) and seen_id != o["message_id"]:
+                    o["result"]["opened"] = {"text": None, "verified": False, "reason": _REPLAY}
+                    o["result"]["payload"] = None
+                elif not isinstance(seen_id, str) and o["message_id"]:
+                    mine[o["commitment"]] = {"message_id": o["message_id"], "opened_at": e2e.iso(now)}
+                    changed = True
+            if not changed:
+                return
+            cutoff = now - _KEEP
+            for commitment, seen in list(mine.items()):
+                try:
+                    if e2e.parse_time(seen["opened_at"]) > cutoff:
+                        continue
+                except (KeyError, TypeError, ValueError):
+                    pass
+                del mine[commitment]
+            _write_all(self.seen_file, everything)
 
     def open(self, message: dict) -> dict | None:
         """Open one message or request that carries an envelope: {"text", "verified"}, with text
-        None and a "reason" when it couldn't be opened. None when it isn't encrypted."""
-        if not isinstance((message or {}).get("encrypted"), dict):
+        None and a "reason" when it couldn't be opened. None when it isn't encrypted. Pass the
+        message as read (with its "id", or a request's "message_id") so a replay can be told from a
+        second read."""
+        if not _sealed(message):
             return None
-        return self._unseal(message, {})[0]
+        reading = _Reading()
+        result = self._unseal(message, reading)
+        self._drop_replays(reading)
+        return result["opened"]
 
     def me(self) -> dict:
         """This agent: its agent_id, which others can send to, its name, and whether a person's account is linked."""

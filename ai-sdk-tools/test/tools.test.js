@@ -325,6 +325,10 @@ test("agentChat takes the key actions strictly, with no private key anywhere in 
   const publish = json.properties.command.anyOf.find((b) => b.properties.action.const === "publish_keys");
   assert.deepEqual(Object.keys(publish.properties), ["action"]);
   assert.match(publish.description, /never leave this machine/);
+  assert.match(publish.description, /next 7 days/);
+  const chat = amessageTools({ write: true, client: fakeClient() }).agentChat.description;
+  assert.match(chat, /Encrypted chats \(new\)/);
+  assert.doesNotMatch(chat, /end-to-end|quantum/i);
 });
 
 test("with encryption on, agentChat's send seals on this machine and reading opens the reply", async () => {
@@ -332,7 +336,7 @@ test("with encryption on, agentChat's send seals on this machine and reading ope
   const BOB = "8f7e6d5c-4b3a-4291-8f7e-6d5c4b3a2918";
   const CONVERSATION = "1a2b3c4d-5e6f-4a1b-8c2d-3e4f5a6b7c8d";
   const bob = e2e.generateIdentity();
-  const bobKey = e2e.newMessageKey(bob.privateKey);
+  const [bobKey] = e2e.newMessageKeys(bob.privateKey);
   const bobKeys = {
     agent_id: BOB,
     identity_key: e2e.b64(bob.publicKey),
@@ -341,6 +345,7 @@ test("with encryption on, agentChat's send seals on this machine and reading ope
   };
   let mine = null;
   const posted = [];
+  const published = [];
   const client = new AMessage({
     token: "agt_test",
     encryption: true,
@@ -350,7 +355,9 @@ test("with encryption on, agentChat's send seals on this machine and reading ope
       const body = init.body ? JSON.parse(init.body) : undefined;
       if (path === "/v1/me") return Response.json({ agent_id: ME, inbox_id: ME, name: null, linked_to_account: false });
       if (path === "/v1/me/keys" && init.method === "PUT") {
-        mine = { agent_id: ME, fingerprint: e2e.fingerprint(e2e.unb64(body.identity_key)), ...body };
+        published.push(body);
+        const [today] = body.message_keys;
+        mine = { agent_id: ME, identity_key: body.identity_key, fingerprint: e2e.fingerprint(e2e.unb64(body.identity_key)), message_key: today };
         return Response.json(mine);
       }
       if (path === `/v1/agents/${BOB}/keys`) return Response.json(bobKeys);
@@ -392,4 +399,7 @@ test("with encryption on, agentChat's send seals on this machine and reading ope
   assert.deepEqual(sent.opened, { text: "Is Thursday free?", verified: true });
   const page = await tools.readConversations.execute({ conversationId: CONVERSATION }, context);
   assert.deepEqual(page.data[0].opened, { text: "Thursday works.", verified: true });
+  assert.equal(published.length, 1);
+  assert.equal(published[0].message_keys.length, 7, "a week of day keys, published once");
+  for (const k of published[0].message_keys) assert.equal(e2e.checkMessageKey(e2e.unb64(published[0].identity_key), k), true);
 });

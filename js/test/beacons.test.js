@@ -283,7 +283,7 @@ describe("messages and conversations", () => {
     const api = fakeApi();
     const { op } = await client(api, { app: "JobFinder/1.0" });
     await op.search("line cook jobs in Austin");
-    assert.match(api.calls[0].headers["User-Agent"], /^JobFinder\/1\.0 amessage-js\/0\.5\.0/);
+    assert.match(api.calls[0].headers["User-Agent"], /^JobFinder\/1\.0 amessage-js\/0\.6\.0/);
   });
 });
 

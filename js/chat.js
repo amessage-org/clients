@@ -96,9 +96,9 @@ export function agentChat(call, command) {
     case "keys":
       return call("GET", "/v1/me/keys");
     case "publish_keys":
-      // Public halves only: the private keys never leave this machine.
+      // Public halves only: the private keys never leave this machine. 1 to 14 day keys, one for today.
       return call("PUT", "/v1/me/keys", {
-        body: { identity_key: command.identity_key, message_key: command.message_key },
+        body: { identity_key: command.identity_key, message_keys: command.message_keys },
       });
     case "agent_keys": {
       const agent = command.agent_id;
